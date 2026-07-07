@@ -102,16 +102,24 @@ export async function findNameAddressSpans(texts: string[]): Promise<string[]> {
 
 /**
  * Replace every occurrence of each span with its deterministically-masked form.
- * Case-INSENSITIVE, because a name is often ALL-CAPS in the source PDF but Title
- * Case in the answer (e.g. "PRASHANT KUMAR SINGH" vs "Prashant Kumar Singh").
+ * Robust to real-world variation between the source PDF and the answer text:
+ *   • case-insensitive ("PRASHANT KUMAR SINGH" vs "Prashant Kumar Singh"),
+ *   • a leading title is stripped ("MR PRASHANT..." still masks "Mr. Prashant..."),
+ *   • flexible whitespace between tokens (single/double spaces, line breaks).
  * maskValue() preserves each match's own length, so formatting stays correct.
  */
 export function maskSpans(text: string, spans: string[]): string {
   let out = text;
-  for (const span of spans) {
-    if (span.trim().length < 2) continue;
-    const re = new RegExp(span.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
-    out = out.replace(re, (m) => maskValue(m));
+  for (const rawSpan of spans) {
+    // Drop a leading honorific so the stored "MR ..." still matches "Mr. ..." etc.
+    const span = rawSpan.replace(/^(?:mr|mrs|ms|dr|m\/s|shri|smt)\.?\s+/i, "").trim();
+    if (span.length < 2) continue;
+    // Escape each whitespace-separated token and join with \s+ (flexible spacing).
+    const pattern = span
+      .split(/\s+/)
+      .map((tok) => tok.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join("\\s+");
+    out = out.replace(new RegExp(pattern, "gi"), (m) => maskValue(m));
   }
   return out;
 }
