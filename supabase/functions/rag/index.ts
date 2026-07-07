@@ -353,7 +353,7 @@ async function ask(question: string) {
   //    trailing period / casing so a refusal can never slip through and pick up
   //    a bogus source (the bug behind "refusal WITH a citation").
   if (isRefusal(answer)) {
-    return { answer: NOT_FOUND_MESSAGE, citations: [] };
+    return { answer: NOT_FOUND_MESSAGE, citations: [], rerankBackend: reranked.backend };
   }
 
   // 9. Attach citations. We surface the passages the model actually cited (by
@@ -387,6 +387,9 @@ async function ask(question: string) {
     answer: masked.texts[0],
     citations,
     warning: warnings.length ? warnings.join(" | ") : undefined,
+    // Diagnostic: which reranker actually ran ("cohere" or "llm"). Lets us confirm
+    // the COHERE_API_KEY path is live; harmless to the UI (ignores unknown fields).
+    rerankBackend: reranked.backend,
   };
 }
 
