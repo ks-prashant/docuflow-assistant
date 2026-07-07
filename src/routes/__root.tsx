@@ -77,12 +77,16 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Paperline — Chat with your documents" },
+      { title: "DocuFlow - Chat with your documents" },
       { name: "description", content: "Upload PDFs and ask questions. Get grounded answers with source citations." },
-      { property: "og:title", content: "Paperline — Chat with your documents" },
+      { property: "og:title", content: "DocuFlow - Chat with your documents" },
       { property: "og:description", content: "Upload PDFs and ask questions. Get grounded answers with source citations." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
+      { name: "twitter:title", content: "DocuFlow - Chat with your documents" },
+      { name: "twitter:description", content: "Upload PDFs and ask questions. Get grounded answers with source citations." },
+      { property: "og:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/8dc56a49-1668-4f8d-b747-3cdc10170b95/id-preview-4d0db518--72013e99-5f57-45b7-9eea-0ef4a3ae35fa.lovable.app-1783446611193.png" },
+      { name: "twitter:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/8dc56a49-1668-4f8d-b747-3cdc10170b95/id-preview-4d0db518--72013e99-5f57-45b7-9eea-0ef4a3ae35fa.lovable.app-1783446611193.png" },
     ],
     links: [
       { rel: "stylesheet", href: appCss },
