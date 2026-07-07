@@ -42,14 +42,18 @@ function DocumentsPage() {
 
   useEffect(() => {
     load();
+    const t = setInterval(load, 3000);
+    return () => clearInterval(t);
   }, []);
 
   async function handleFiles(files: FileList | null) {
+    console.log("[upload] handleFiles", files?.length);
     if (!files || files.length === 0) return;
     setError(null);
     setUploading(true);
     try {
       for (const file of Array.from(files)) {
+        console.log("[upload] file", file.name, file.size, file.type);
         if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
           setError("Only PDF files are supported.");
           continue;
@@ -58,7 +62,11 @@ function DocumentsPage() {
         const { error: upErr } = await supabase.storage
           .from("documents")
           .upload(path, file, { contentType: "application/pdf" });
-        if (upErr) throw upErr;
+        console.log("[upload] storage result", upErr);
+        if (upErr) {
+          setError(`Storage upload failed: ${upErr.message}`);
+          throw upErr;
+        }
         const { data: inserted, error: insErr } = await supabase
           .from("documents")
           .insert({
@@ -69,21 +77,29 @@ function DocumentsPage() {
           })
           .select()
           .single();
-        if (insErr) throw insErr;
+        console.log("[upload] insert result", inserted, insErr);
+        if (insErr) {
+          setError(`DB insert failed: ${insErr.message}`);
+          throw insErr;
+        }
 
-        // Kick off server-side processing: the edge function chunks the PDF,
-        // creates embeddings, and stores them. We don't await the whole job in a
-        // blocking way for the UI — status on the row moves uploaded → processing
-        // → indexed, and load() below reflects the latest state.
         if (inserted) {
+          await load();
           supabase.functions
             .invoke("rag", { body: { action: "ingest", documentId: inserted.id } })
-            .then(() => load())
-            .catch((e) => console.error("Ingest failed:", e));
+            .then((r) => {
+              console.log("[upload] ingest result", r);
+              load();
+            })
+            .catch((e) => {
+              console.error("[upload] Ingest failed:", e);
+              setError(`Ingest failed: ${e?.message ?? e}`);
+            });
         }
       }
       await load();
     } catch (e) {
+      console.error("[upload] error", e);
       setError(e instanceof Error ? e.message : "Upload failed");
     } finally {
       setUploading(false);
@@ -185,6 +201,25 @@ function DocumentsPage() {
                       })}
                     </div>
                   </div>
+                  <span
+                    className={
+                      "text-xs px-2 py-1 rounded-full border " +
+                      (d.status === "indexed"
+                        ? "border-primary/30 text-primary bg-primary/5"
+                        : d.status === "failed" || d.status === "no_text"
+                          ? "border-destructive/30 text-destructive bg-destructive/5"
+                          : "border-border text-muted-foreground bg-muted")
+                    }
+                  >
+                    {d.status === "processing" || d.status === "uploaded" ? (
+                      <span className="inline-flex items-center gap-1">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        {d.status}
+                      </span>
+                    ) : (
+                      d.status
+                    )}
+                  </span>
                   <button
                     onClick={() => remove(d)}
                     className="p-2 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"

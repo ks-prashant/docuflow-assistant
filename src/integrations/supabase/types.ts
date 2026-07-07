@@ -108,7 +108,21 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
-      [_ in never]: never
+      match_document_chunks: {
+        Args: {
+          match_count?: number
+          min_similarity?: number
+          query_embedding: string
+        }
+        Returns: {
+          content: string
+          document_id: string
+          filename: string
+          id: string
+          page_number: number
+          similarity: number
+        }[]
+      }
     }
     Enums: {
       [_ in never]: never
