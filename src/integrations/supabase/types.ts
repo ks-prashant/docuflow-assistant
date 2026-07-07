@@ -42,6 +42,7 @@ export type Database = {
         Row: {
           chunk_index: number
           content: string
+          content_tsv: unknown
           created_at: string
           document_id: string
           embedding: string | null
@@ -51,6 +52,7 @@ export type Database = {
         Insert: {
           chunk_index: number
           content: string
+          content_tsv?: unknown
           created_at?: string
           document_id: string
           embedding?: string | null
@@ -60,6 +62,7 @@ export type Database = {
         Update: {
           chunk_index?: number
           content?: string
+          content_tsv?: unknown
           created_at?: string
           document_id?: string
           embedding?: string | null
@@ -121,6 +124,17 @@ export type Database = {
           id: string
           page_number: number
           similarity: number
+        }[]
+      }
+      match_document_chunks_fts: {
+        Args: { match_count?: number; query_text: string }
+        Returns: {
+          content: string
+          document_id: string
+          filename: string
+          id: string
+          page_number: number
+          rank: number
         }[]
       }
     }
