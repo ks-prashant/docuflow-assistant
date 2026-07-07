@@ -28,7 +28,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { extractText, getDocumentProxy } from "https://esm.sh/unpdf@0.12.1";
 // Retrieval quality + safety are split into their own small, swappable modules.
 import { rerank } from "./rerank.ts";               // wide-recall candidates → precise top-N
-import { maskOutputs, maskStructured } from "./mask.ts"; // OUTPUT-ONLY PII masking + regex net
+import { maskStructured, maskSpans, findNameAddressSpans } from "./mask.ts"; // OUTPUT-ONLY PII masking
 import { transformQuery } from "./querytransform.ts"; // expand question → search variants (Change 5)
 import { chunkPage } from "./chunk.ts";             // structure-aware chunking (Change 7)
 import { summarizeDocument, generateContexts } from "./context.ts"; // per-chunk context (Change 6)
@@ -364,9 +364,17 @@ function askStream(question: string): ReadableStream<Uint8Array> {
           .join("\n\n---\n\n");
         const systemPrompt = buildSystemPrompt(context);
 
-        // 7. STREAM the answer from OpenAI. We forward tokens as they arrive, but
-        //    apply the deterministic regex mask to each flushed segment (a safety
-        //    net for structured PII on top of the model's inline masking).
+        // 7. STREAM the answer from OpenAI. Two masking layers protect the stream:
+        //    (a) regex net for structured PII (phone/email/IDs/PAN/Aadhaar), and
+        //    (b) deterministic NAME/ADDRESS masking using spans we extract from the
+        //        retrieved chunks up front (the answer's names come from there) —
+        //        because the model alone does NOT reliably mask names inline.
+        //    We start the span extraction and the answer generation in parallel so
+        //    the extra call barely adds latency, and flush at SENTENCE boundaries so
+        //    a whole name is always within the segment we mask.
+        const spansPromise = findNameAddressSpans(chunks.map((c) => c.content))
+          .catch(() => null); // null → couldn't extract; we degrade + warn below
+
         const res = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -387,23 +395,40 @@ function askStream(question: string): ReadableStream<Uint8Array> {
           throw new Error(`OpenAI chat failed: ${res.status} ${res.body ? await res.text() : "(no body)"}`);
         }
 
+        const piiSpans = await spansPromise;
+        if (piiSpans === null) {
+          warnings.push("Name/address masking degraded (span extraction failed); structured PII still masked");
+        }
+
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let sseBuf = "";     // raw SSE lines not yet parsed
-        let outBuf = "";     // model text not yet safe to flush (regex needs whole tokens)
+        let outBuf = "";     // model text not yet safe to flush
         let fullAnswer = ""; // the masked answer we accumulate for refusal/citation logic
 
-        // Flush emits masked text up to the last whitespace boundary, so a number
-        // or email is never cut in half before the regex mask sees it.
+        // Flush emits masked text up to the last SENTENCE boundary (so a full name
+        // is never split across segments). Structured regex + known name/address
+        // spans are applied to each segment before it leaves the server.
         const flush = (final: boolean) => {
           if (!outBuf) return;
-          let upto = outBuf.length;
-          if (!final) {
-            const ws = Math.max(outBuf.lastIndexOf(" "), outBuf.lastIndexOf("\n"));
-            upto = ws >= 0 ? ws + 1 : 0;
+          let upto: number;
+          if (final) {
+            upto = outBuf.length;
+          } else {
+            const matches = [...outBuf.matchAll(/[.!?\n]["')\]]?\s/g)];
+            if (matches.length > 0) {
+              const last = matches[matches.length - 1];
+              upto = (last.index ?? 0) + last[0].length;
+            } else if (outBuf.length > 400) {
+              const ws = outBuf.lastIndexOf(" "); // fallback for a very long run
+              upto = ws >= 0 ? ws + 1 : 0;
+            } else {
+              upto = 0; // hold until we have a complete sentence
+            }
           }
           if (upto === 0) return;
-          const seg = maskStructured(outBuf.slice(0, upto));
+          let seg = maskStructured(outBuf.slice(0, upto));
+          if (piiSpans) seg = maskSpans(seg, piiSpans);
           outBuf = outBuf.slice(upto);
           fullAnswer += seg;
           send({ type: "token", text: seg });
@@ -439,22 +464,18 @@ function askStream(question: string): ReadableStream<Uint8Array> {
           return;
         }
 
-        // 9. Choose citations from the bracket numbers the model cited (or top-3).
+        // 9. Choose citations from the bracket numbers the model cited (or top-3),
+        //    and mask each snippet with the SAME spans we already extracted (the
+        //    snippets come from these very chunks, so coverage is exact — no extra
+        //    LLM call needed). Skipped entirely on refusals above (no PII to mask).
         const cited = new Set([...answer.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])));
         const chosen = cited.size > 0 ? chunks.filter((_, i) => cited.has(i + 1)) : chunks.slice(0, 3);
-        const rawSnippets = chosen.map((c) =>
-          c.content.length > 240 ? c.content.slice(0, 240) + "…" : c.content
-        );
-
-        // 10. Mask the snippets deterministically (regex + LLM name/address finder).
-        //     This runs only when there ARE citations (skipped on refusals above).
-        const maskedSnips = await maskOutputs(rawSnippets);
-        if (maskedSnips.warning) warnings.push(maskedSnips.warning);
-        const citations = chosen.map((c, i) => ({
-          document: c.filename,
-          page: c.page_number ?? undefined,
-          snippet: maskedSnips.texts[i],
-        }));
+        const citations = chosen.map((c) => {
+          const raw = c.content.length > 240 ? c.content.slice(0, 240) + "…" : c.content;
+          let snippet = maskStructured(raw);
+          if (piiSpans) snippet = maskSpans(snippet, piiSpans);
+          return { document: c.filename, page: c.page_number ?? undefined, snippet };
+        });
 
         send({ type: "done", citations, warning: joinWarnings(warnings), rerankBackend: reranked.backend });
         controller.close();

@@ -67,7 +67,7 @@ export function maskStructured(text: string): string {
 // inconsistently — e.g. leaving a surname visible). Instead the model only
 // IDENTIFIES the name/address spans, and we apply the deterministic maskValue()
 // ourselves. That guarantees the tail-3 formatting and never partially leaks.
-async function findNameAddressSpans(texts: string[]): Promise<string[]> {
+export async function findNameAddressSpans(texts: string[]): Promise<string[]> {
   const prompt =
     `Find every PERSON NAME and every FULL STREET/POSTAL ADDRESS in the texts ` +
     `below. Return each exactly as it appears (verbatim substrings), including ` +
@@ -100,10 +100,19 @@ async function findNameAddressSpans(texts: string[]): Promise<string[]> {
     .sort((a, b) => b.length - a.length);
 }
 
-/** Replace every occurrence of each span with its deterministically-masked form. */
-function maskSpans(text: string, spans: string[]): string {
+/**
+ * Replace every occurrence of each span with its deterministically-masked form.
+ * Case-INSENSITIVE, because a name is often ALL-CAPS in the source PDF but Title
+ * Case in the answer (e.g. "PRASHANT KUMAR SINGH" vs "Prashant Kumar Singh").
+ * maskValue() preserves each match's own length, so formatting stays correct.
+ */
+export function maskSpans(text: string, spans: string[]): string {
   let out = text;
-  for (const span of spans) out = out.split(span).join(maskValue(span));
+  for (const span of spans) {
+    if (span.trim().length < 2) continue;
+    const re = new RegExp(span.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    out = out.replace(re, (m) => maskValue(m));
+  }
   return out;
 }
 
