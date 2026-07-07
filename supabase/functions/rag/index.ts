@@ -27,15 +27,22 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 // needs. We ask it for text PER PAGE so every chunk can carry a page number.
 import { extractText, getDocumentProxy } from "https://esm.sh/unpdf@0.12.1";
 // Retrieval quality + safety are split into their own small, swappable modules.
-import { rerank } from "./rerank.ts";     // wide-recall candidates → precise top-N
-import { maskOutputs } from "./mask.ts";  // OUTPUT-ONLY PII masking (answer + snippets)
+import { rerank } from "./rerank.ts";               // wide-recall candidates → precise top-N
+import { maskOutputs } from "./mask.ts";            // OUTPUT-ONLY PII masking (answer + snippets)
+import { transformQuery } from "./querytransform.ts"; // expand question → search variants (Change 5)
+import { chunkPage } from "./chunk.ts";             // structure-aware chunking (Change 7)
+import { summarizeDocument, generateContexts } from "./context.ts"; // per-chunk context (Change 6)
 
 // ---------------------------------------------------------------------------
 // Configuration — all the knobs in one place so they're easy to explain/tune.
 // ---------------------------------------------------------------------------
 const EMBEDDING_MODEL = "text-embedding-3-small"; // 1536 dims → matches our vector column
-const CHAT_MODEL = "gpt-4o-mini";                 // cheap, strong instruction-following
-const CHAT_TEMPERATURE = 0.1;                      // low = faithful, repeatable answers
+// Two model tiers (Change 7): a stronger model writes the final answer; a cheap
+// model does the many helper steps (query transform, context generation, LLM
+// rerank fallback, PII redaction). Switch the answer model here in one place.
+const ANSWER_MODEL = "gpt-4o";      // final grounded answer — better synthesis, fewer false refusals
+const HELPER_MODEL = "gpt-4o-mini"; // cheap helper steps
+const CHAT_TEMPERATURE = 0.1;        // low = faithful, repeatable answers
 
 const CHUNK_SIZE = 1000;      // ~target characters per chunk (a few paragraphs)
 const CHUNK_OVERLAP = 150;    // characters shared between neighbours so we don't
@@ -114,44 +121,8 @@ async function embed(inputs: string[]): Promise<number[][]> {
     .map((d: { embedding: number[] }) => d.embedding);
 }
 
-// ===========================================================================
-// Text chunking
-//
-// LLMs and embeddings work best on bite-sized passages, and small chunks make
-// citations precise ("this paragraph on page 4" beats "somewhere in this file").
-// We split each PAGE independently so a chunk never straddles two pages and its
-// page_number stays truthful. Overlap keeps ideas that sit on a boundary intact.
-// ===========================================================================
-function chunkText(text: string): string[] {
-  const clean = text.replace(/\s+/g, " ").trim();
-  if (!clean) return [];
-
-  const chunks: string[] = [];
-  let start = 0;
-  while (start < clean.length) {
-    let end = Math.min(start + CHUNK_SIZE, clean.length);
-
-    // Prefer to end a chunk at a sentence/space boundary near the target size,
-    // rather than mid-word, so chunks read naturally.
-    if (end < clean.length) {
-      const window = clean.slice(start, end);
-      const lastBreak = Math.max(
-        window.lastIndexOf(". "),
-        window.lastIndexOf("? "),
-        window.lastIndexOf("! "),
-        window.lastIndexOf("\n"),
-      );
-      if (lastBreak > CHUNK_SIZE * 0.5) end = start + lastBreak + 1;
-    }
-
-    const piece = clean.slice(start, end).trim();
-    if (piece) chunks.push(piece);
-
-    if (end >= clean.length) break;
-    start = end - CHUNK_OVERLAP; // step back so the next chunk overlaps this one
-  }
-  return chunks;
-}
+// Text chunking now lives in the structure-aware module ./chunk.ts (chunkPage),
+// which preserves headings and keeps tables/lists intact (Change 7).
 
 // ===========================================================================
 // ACTION 1 — INGEST: PDF  →  chunks  →  embeddings  →  Postgres
@@ -182,11 +153,13 @@ async function ingest(documentId: string) {
     const { text: pages } = await extractText(pdf, { mergePages: false });
     const pageTexts: string[] = Array.isArray(pages) ? pages : [pages];
 
-    // 4. Chunk every page, remembering which page each chunk came from.
-    const records: { content: string; page_number: number }[] = [];
+    // 4. STRUCTURE-AWARE CHUNKING (Change 7): split each page while preserving
+    //    headings and keeping tables/lists intact. Each chunk remembers its page
+    //    and the nearest heading it sits under.
+    const records: { content: string; page_number: number; heading: string | null }[] = [];
     pageTexts.forEach((pageText, i) => {
-      for (const content of chunkText(pageText ?? "")) {
-        records.push({ content, page_number: i + 1 }); // pages are 1-indexed for humans
+      for (const c of chunkPage(pageText ?? "", CHUNK_SIZE, CHUNK_OVERLAP)) {
+        records.push({ content: c.content, page_number: i + 1, heading: c.heading });
       }
     });
 
@@ -197,17 +170,34 @@ async function ingest(documentId: string) {
       return { documentId, chunks: 0, note: "No extractable text (is this a scanned PDF?)" };
     }
 
-    // 5. Embed the chunks in batches, then store each chunk + its vector.
+    // 5. CONTEXTUAL RETRIEVAL (Change 6): summarize the doc once, then generate a
+    //    one-line context per chunk. We embed context+chunk, but STORE the raw
+    //    chunk. If context generation degrades, we embed the raw text instead.
+    const summary = await summarizeDocument(pageTexts, records.map((r) => r.heading ?? ""));
+    const { contexts, warning: ctxWarning } = await generateContexts(
+      summary,
+      records.map((r) => ({ content: r.content, heading: r.heading })),
+    );
+
+    // 6. Embed in batches (context-prepended text) and store each chunk + vector.
     let chunkIndex = 0;
     for (let i = 0; i < records.length; i += EMBED_BATCH_SIZE) {
       const batch = records.slice(i, i + EMBED_BATCH_SIZE);
-      const vectors = await embed(batch.map((r) => r.content));
+      const batchContexts = contexts.slice(i, i + EMBED_BATCH_SIZE);
+      // The text we EMBED = context line + raw chunk (or just the chunk if the
+      // context degraded). The text we STORE in `content` is always the raw chunk.
+      const embedInputs = batch.map((r, j) =>
+        batchContexts[j] ? `${batchContexts[j]}\n\n${r.content}` : r.content
+      );
+      const vectors = await embed(embedInputs);
 
       const rows = batch.map((r, j) => ({
         document_id: documentId,
         chunk_index: chunkIndex++,
-        content: r.content,
+        content: r.content,       // raw chunk — used for citations + keyword search
         page_number: r.page_number,
+        heading: r.heading,
+        context_line: batchContexts[j],
         // pgvector accepts its text form "[0.1,0.2,...]", which is exactly what
         // JSON.stringify(array) produces — so we store the vector as a string.
         embedding: JSON.stringify(vectors[j]),
@@ -217,9 +207,9 @@ async function ingest(documentId: string) {
       if (insErr) throw new Error(`Failed to store chunks: ${insErr.message}`);
     }
 
-    // 6. Done — the document is now searchable.
+    // 7. Done — the document is now searchable.
     await supabase.from("documents").update({ status: "indexed" }).eq("id", documentId);
-    return { documentId, chunks: records.length };
+    return { documentId, chunks: records.length, warning: ctxWarning };
   } catch (err) {
     // Never leave a document stuck on "processing"; record the failure.
     await supabase.from("documents").update({ status: "failed" }).eq("id", documentId);
@@ -263,29 +253,40 @@ function rrf(lists: Chunk[][], k: number): Chunk[] {
 async function ask(question: string) {
   const warnings: string[] = []; // soft, non-fatal issues to surface in the UI
 
-  // 1. Turn the question into the same kind of vector as our chunks.
-  const [questionEmbedding] = await embed([question]);
+  // 1. QUERY TRANSFORM (Change 5) — expand the raw question into 2–3 search
+  //    variants (jargon/synonyms + vague→concrete), so a hit under ANY phrasing
+  //    can surface. Falls back to just the original question on failure.
+  const transformed = await transformQuery(question);
+  if (transformed.warning) warnings.push(transformed.warning);
+  const variants = transformed.variants;
 
-  // 2. HYBRID RETRIEVAL — run both searches in parallel:
-  //    • semantic (meaning) via pgvector, with only a very low garbage floor;
-  //    • keyword (exact terms) via Postgres full-text search.
-  //    Either arm failing is a real error we surface — never a silent empty result.
-  const [sem, fts] = await Promise.all([
-    supabase.rpc("match_document_chunks", {
-      query_embedding: JSON.stringify(questionEmbedding),
-      match_count: RETRIEVE_CANDIDATES,
-      min_similarity: SEMANTIC_FLOOR,
-    }),
-    supabase.rpc("match_document_chunks_fts", {
-      query_text: question,
-      match_count: RETRIEVE_CANDIDATES,
-    }),
-  ]);
-  if (sem.error) throw new Error(`Semantic retrieval failed: ${sem.error.message}`);
-  if (fts.error) throw new Error(`Keyword retrieval failed: ${fts.error.message}`);
+  // 2. Embed all variants in a single API call.
+  const variantEmbeddings = await embed(variants);
 
-  // 3. Fuse the two ranked lists into one candidate list (Reciprocal Rank Fusion).
-  const fused = rrf([(sem.data ?? []) as Chunk[], (fts.data ?? []) as Chunk[]], RRF_K);
+  // 3. HYBRID RETRIEVAL for EACH variant, all in parallel: semantic (meaning) via
+  //    pgvector + keyword (exact terms) via full-text search. Any arm failing is a
+  //    real error we surface — never a silent empty result.
+  const searches = await Promise.all(
+    variants.flatMap((variant, i) => [
+      supabase.rpc("match_document_chunks", {
+        query_embedding: JSON.stringify(variantEmbeddings[i]),
+        match_count: RETRIEVE_CANDIDATES,
+        min_similarity: SEMANTIC_FLOOR,
+      }),
+      supabase.rpc("match_document_chunks_fts", {
+        query_text: variant,
+        match_count: RETRIEVE_CANDIDATES,
+      }),
+    ]),
+  );
+  for (const r of searches) {
+    if (r.error) throw new Error(`Retrieval failed: ${r.error.message}`);
+  }
+
+  // 4. Fuse EVERY ranked list (each variant's semantic + keyword results) with
+  //    Reciprocal Rank Fusion. It dedupes and rewards chunks that surface under
+  //    multiple phrasings — exactly what multi-query is meant to exploit.
+  const fused = rrf(searches.map((r) => (r.data ?? []) as Chunk[]), RRF_K);
 
   // Only refuse up front if there is genuinely nothing to work with (e.g. no
   // documents indexed). Otherwise we ALWAYS let the model judge relevance.
@@ -293,8 +294,9 @@ async function ask(question: string) {
     return { answer: NOT_FOUND_MESSAGE, citations: [] };
   }
 
-  // 4. RERANK for precision: score the wide candidate set against the question and
-  //    keep only the best few. Degrades gracefully (Cohere → LLM → retrieval order).
+  // 5. RERANK for precision against the ORIGINAL question (the user's true intent,
+  //    not the expanded variants): score the wide candidate set and keep the best
+  //    few. Degrades gracefully (Cohere → LLM → retrieval order).
   const reranked = await rerank(question, fused.slice(0, RETRIEVE_CANDIDATES), RERANK_TOP_N);
   if (reranked.warning) warnings.push(reranked.warning);
   const chunks = reranked.items;
@@ -335,7 +337,7 @@ async function ask(question: string) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: CHAT_MODEL,
+      model: ANSWER_MODEL,
       temperature: CHAT_TEMPERATURE,
       messages: [
         { role: "system", content: systemPrompt },
