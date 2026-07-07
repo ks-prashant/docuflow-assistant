@@ -5,6 +5,16 @@ import { AppShell } from "@/components/AppShell";
 import { FileText, Upload, Trash2, Loader2, RefreshCw } from "lucide-react";
 
 export const Route = createFileRoute("/")({
+  head: () => ({
+    meta: [
+      { title: "Your documents — DocuFlow" },
+      {
+        name: "description",
+        content:
+          "Upload PDFs to build a private, cited knowledge base. DocuFlow only answers from what you upload.",
+      },
+    ],
+  }),
   component: DocumentsPage,
 });
 
@@ -137,11 +147,13 @@ function DocumentsPage() {
   return (
     <AppShell>
       <div className="mx-auto max-w-3xl px-6 py-16">
-        <div className="mb-10">
-          <h1 className="font-display text-5xl leading-tight">Your documents</h1>
-          <p className="mt-3 text-muted-foreground max-w-lg">
-            Upload PDFs to build a private knowledge base. Then head to Chat to ask
-            questions and get answers with citations.
+        <div className="mb-12">
+          <h1 className="font-display text-5xl leading-[1.1]">
+            Answers you can trust, sourced from your documents.
+          </h1>
+          <p className="mt-5 text-muted-foreground max-w-xl text-[15px] leading-relaxed">
+            DocuFlow only answers from what you upload — every response is cited,
+            and if it's not in your documents, it says so.
           </p>
         </div>
 
