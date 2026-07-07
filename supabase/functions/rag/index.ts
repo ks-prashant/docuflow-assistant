@@ -176,7 +176,12 @@ async function ingest(documentId: string) {
     // 5. CONTEXTUAL RETRIEVAL (Change 6): summarize the doc once, then generate a
     //    one-line context per chunk. We embed context+chunk, but STORE the raw
     //    chunk. If context generation degrades, we embed the raw text instead.
-    const summary = await summarizeDocument(pageTexts, records.map((r) => r.heading ?? ""));
+    //    In parallel we extract this document's PERSONAL-DATA spans (names +
+    //    addresses) once, so answer-time masking is deterministic and reliable.
+    const [summary, docPiiSpans] = await Promise.all([
+      summarizeDocument(pageTexts, records.map((r) => r.heading ?? "")),
+      findNameAddressSpans(pageTexts).catch(() => [] as string[]),
+    ]);
     const { contexts, warning: ctxWarning } = await generateContexts(
       summary,
       records.map((r) => ({ content: r.content, heading: r.heading })),
@@ -210,9 +215,11 @@ async function ingest(documentId: string) {
       if (insErr) throw new Error(`Failed to store chunks: ${insErr.message}`);
     }
 
-    // 7. Done — the document is now searchable.
-    await supabase.from("documents").update({ status: "indexed" }).eq("id", documentId);
-    return { documentId, chunks: records.length, warning: ctxWarning };
+    // 7. Done — the document is now searchable. Store its PII spans for masking.
+    await supabase.from("documents")
+      .update({ status: "indexed", pii_spans: docPiiSpans })
+      .eq("id", documentId);
+    return { documentId, chunks: records.length, piiSpans: docPiiSpans.length, warning: ctxWarning };
   } catch (err) {
     // Never leave a document stuck on "processing"; record the failure.
     await supabase.from("documents").update({ status: "failed" }).eq("id", documentId);
@@ -364,17 +371,19 @@ function askStream(question: string): ReadableStream<Uint8Array> {
           .join("\n\n---\n\n");
         const systemPrompt = buildSystemPrompt(context);
 
-        // 7. STREAM the answer from OpenAI. Two masking layers protect the stream:
-        //    (a) regex net for structured PII (phone/email/IDs/PAN/Aadhaar), and
-        //    (b) deterministic NAME/ADDRESS masking using spans we extract from the
-        //        retrieved chunks up front (the answer's names come from there) —
-        //        because the model alone does NOT reliably mask names inline.
-        //    We start the span extraction and the answer generation in parallel so
-        //    the extra call barely adds latency, and flush at SENTENCE boundaries so
-        //    a whole name is always within the segment we mask.
-        const spansPromise = findNameAddressSpans(chunks.map((c) => c.content))
-          .catch(() => null); // null → couldn't extract; we degrade + warn below
+        // 7. Load this document's stored PERSONAL-DATA spans (names + addresses),
+        //    extracted reliably at ingestion. We mask these deterministically in
+        //    the stream — the model alone does NOT reliably mask names inline, and
+        //    a stored list means no per-question LLM guess (reliable AND faster).
+        const docIds = [...new Set(chunks.map((c) => c.document_id))];
+        const { data: docRows } = await supabase
+          .from("documents").select("pii_spans").in("id", docIds);
+        const piiSpans = [...new Set(
+          (docRows ?? []).flatMap((d) => (d.pii_spans ?? []) as string[]),
+        )].sort((a, b) => b.length - a.length); // longer first: full name before surname
 
+        // Stream the answer from OpenAI. Flush at SENTENCE boundaries so a whole
+        // name is always within the segment we mask (regex + known spans).
         const res = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -393,11 +402,6 @@ function askStream(question: string): ReadableStream<Uint8Array> {
         });
         if (!res.ok || !res.body) {
           throw new Error(`OpenAI chat failed: ${res.status} ${res.body ? await res.text() : "(no body)"}`);
-        }
-
-        const piiSpans = await spansPromise;
-        if (piiSpans === null) {
-          warnings.push("Name/address masking degraded (span extraction failed); structured PII still masked");
         }
 
         const reader = res.body.getReader();
@@ -428,7 +432,7 @@ function askStream(question: string): ReadableStream<Uint8Array> {
           }
           if (upto === 0) return;
           let seg = maskStructured(outBuf.slice(0, upto));
-          if (piiSpans) seg = maskSpans(seg, piiSpans);
+          if (piiSpans.length) seg = maskSpans(seg, piiSpans);
           outBuf = outBuf.slice(upto);
           fullAnswer += seg;
           send({ type: "token", text: seg });
@@ -473,7 +477,7 @@ function askStream(question: string): ReadableStream<Uint8Array> {
         const citations = chosen.map((c) => {
           const raw = c.content.length > 240 ? c.content.slice(0, 240) + "…" : c.content;
           let snippet = maskStructured(raw);
-          if (piiSpans) snippet = maskSpans(snippet, piiSpans);
+          if (piiSpans.length) snippet = maskSpans(snippet, piiSpans);
           return { document: c.filename, page: c.page_number ?? undefined, snippet };
         });
 
