@@ -28,7 +28,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { extractText, getDocumentProxy } from "https://esm.sh/unpdf@0.12.1";
 // Retrieval quality + safety are split into their own small, swappable modules.
 import { rerank } from "./rerank.ts";               // wide-recall candidates → precise top-N
-import { maskOutputs } from "./mask.ts";            // OUTPUT-ONLY PII masking (answer + snippets)
+import { maskOutputs, maskStructured } from "./mask.ts"; // OUTPUT-ONLY PII masking + regex net
 import { transformQuery } from "./querytransform.ts"; // expand question → search variants (Change 5)
 import { chunkPage } from "./chunk.ts";             // structure-aware chunking (Change 7)
 import { summarizeDocument, generateContexts } from "./context.ts"; // per-chunk context (Change 6)
@@ -40,8 +40,11 @@ const EMBEDDING_MODEL = "text-embedding-3-small"; // 1536 dims → matches our v
 // Two model tiers (Change 7): a stronger model writes the final answer; a cheap
 // model does the many helper steps (query transform, context generation, LLM
 // rerank fallback, PII redaction). Switch the answer model here in one place.
-const ANSWER_MODEL = "gpt-4o";      // final grounded answer — better synthesis, fewer false refusals
-const HELPER_MODEL = "gpt-4o-mini"; // cheap helper steps
+const ANSWER_MODEL = "gpt-4o-mini";  // final answer — fast + cheap; a detailed prompt
+                                     // carries answer quality. Switch here in one place.
+                                     // (Helper steps — query transform, context gen,
+                                     // rerank fallback, snippet redaction — also use
+                                     // gpt-4o-mini, set inside their own modules.)
 const CHAT_TEMPERATURE = 0.1;        // low = faithful, repeatable answers
 
 const CHUNK_SIZE = 1000;      // ~target characters per chunk (a few paragraphs)
@@ -247,152 +250,225 @@ function rrf(lists: Chunk[][], k: number): Chunk[] {
   return [...byId.values()].sort((a, b) => score.get(b.id)! - score.get(a.id)!);
 }
 
-// ===========================================================================
-// ACTION 2 — ASK: question → hybrid retrieve → rerank → grounded answer → mask
-// ===========================================================================
-async function ask(question: string) {
-  const warnings: string[] = []; // soft, non-fatal issues to surface in the UI
-
-  // 1. QUERY TRANSFORM (Change 5) — expand the raw question into 2–3 search
-  //    variants (jargon/synonyms + vague→concrete), so a hit under ANY phrasing
-  //    can surface. Falls back to just the original question on failure.
-  const transformed = await transformQuery(question);
-  if (transformed.warning) warnings.push(transformed.warning);
-  const variants = transformed.variants;
-
-  // 2. Embed all variants in a single API call.
-  const variantEmbeddings = await embed(variants);
-
-  // 3. HYBRID RETRIEVAL for EACH variant, all in parallel: semantic (meaning) via
-  //    pgvector + keyword (exact terms) via full-text search. Any arm failing is a
-  //    real error we surface — never a silent empty result.
-  const searches = await Promise.all(
-    variants.flatMap((variant, i) => [
-      supabase.rpc("match_document_chunks", {
-        query_embedding: JSON.stringify(variantEmbeddings[i]),
-        match_count: RETRIEVE_CANDIDATES,
-        min_similarity: SEMANTIC_FLOOR,
-      }),
-      supabase.rpc("match_document_chunks_fts", {
-        query_text: variant,
-        match_count: RETRIEVE_CANDIDATES,
-      }),
-    ]),
-  );
-  for (const r of searches) {
-    if (r.error) throw new Error(`Retrieval failed: ${r.error.message}`);
+// Decide whether a question needs the (latency-adding) query-transform step.
+// Long, specific questions are usually self-sufficient, so we skip the rewrite to
+// save ~0.5–1.5s. Short or vaguely-worded ones ("whose policy is this?") benefit
+// from jargon expansion, so we keep it for them.
+function needsRephrase(question: string): boolean {
+  const words = question.trim().split(/\s+/).filter(Boolean);
+  if (words.length <= 6) return true;                              // short → expand
+  if (words.length < 10 && /\b(this|that|these|those|it|whose|they|there)\b/i.test(question)) {
+    return true;                                                   // vague reference → expand
   }
+  return false;                                                    // long & specific → skip
+}
 
-  // 4. Fuse EVERY ranked list (each variant's semantic + keyword results) with
-  //    Reciprocal Rank Fusion. It dedupes and rewards chunks that surface under
-  //    multiple phrasings — exactly what multi-query is meant to exploit.
-  const fused = rrf(searches.map((r) => (r.data ?? []) as Chunk[]), RRF_K);
-
-  // Only refuse up front if there is genuinely nothing to work with (e.g. no
-  // documents indexed). Otherwise we ALWAYS let the model judge relevance.
-  if (fused.length === 0) {
-    return { answer: NOT_FOUND_MESSAGE, citations: [] };
-  }
-
-  // 5. RERANK for precision against the ORIGINAL question (the user's true intent,
-  //    not the expanded variants): score the wide candidate set and keep the best
-  //    few. Degrades gracefully (Cohere → LLM → retrieval order).
-  const reranked = await rerank(question, fused.slice(0, RETRIEVE_CANDIDATES), RERANK_TOP_N);
-  if (reranked.warning) warnings.push(reranked.warning);
-  const chunks = reranked.items;
-
-  // 5. Build a numbered context block. Numbering lets the model cite "[1]", and
-  //    lets us map that citation back to a real file + page for the UI.
-  const context = chunks
-    .map((c, i) => `[${i + 1}] (${c.filename}, page ${c.page_number ?? "?"})\n${c.content}`)
-    .join("\n\n---\n\n");
-
-  // 6. The system prompt — this is what keeps the model honest. It is grounded
-  //    (only the passages, no outside knowledge) but NOT extractive-only: the
-  //    model may summarize and synthesize ACROSS the passages, so broad questions
-  //    like "what is this about?" get a real answer instead of a refusal.
-  const systemPrompt = [
-    "You are a document assistant. Answer the user's question using ONLY the",
-    "numbered context passages provided below. Follow these rules exactly:",
-    "1. Use only information stated in or directly supported by the passages.",
-    "   Never use outside knowledge and never invent facts.",
-    "2. You MAY combine and summarize across multiple passages to answer broad",
-    "   questions (e.g. what a document is about, or an overview) — as long as",
-    "   every claim is grounded in the passages.",
-    `3. Only if the passages genuinely do not address the question, reply with`,
-    `   exactly: "${NOT_FOUND_MESSAGE}" and nothing else. Do not refuse just`,
-    "   because the answer is spread across passages or not phrased as a summary.",
-    "4. When you answer, cite the passage(s) you used with their bracket numbers,",
-    "   e.g. [1] or [2]. Quote source wording where helpful. Be concise.",
+// The answer instructions. Detailed on HOW to write a good grounded answer, and —
+// because answers now STREAM token-by-token — it masks personal data INLINE as it
+// writes (so nothing unmasked ever reaches the browser). A deterministic regex net
+// on the outgoing stream still guarantees the structured PII types.
+function buildSystemPrompt(context: string): string {
+  return [
+    "You are a meticulous insurance-document assistant. Answer the user's question",
+    "using ONLY the numbered context passages below.",
+    "",
+    "HOW TO ANSWER WELL:",
+    "- Ground every statement in the passages. Never use outside knowledge or guess.",
+    "- Start with a direct answer to the exact question, then the key supporting detail.",
+    "- You MAY combine and summarize across passages for broad questions.",
+    "- Preserve specifics exactly: numbers, percentages, monetary limits, time periods,",
+    "  and section names (e.g. \"1% of Sum Insured per day\", \"Section B.3\").",
+    "- When values come from a table/sub-limit list, pair each value with what it applies to.",
+    "- Format with brief markdown: a lead sentence, then bullet points for multiple values.",
+    "  Be concise — no filler, no repeating the question.",
+    "- Cite the passages you used with bracket numbers like [1], [2].",
+    `- ONLY if the passages genuinely do not address the question, reply with EXACTLY`,
+    `  "${NOT_FOUND_MESSAGE}" and nothing else. Do not refuse just because the answer is`,
+    "  spread across passages or not phrased as a summary.",
+    "",
+    "PRIVACY — mask personal data IN YOUR ANSWER as you write it:",
+    "- Replace person names, full postal addresses, phone numbers, email addresses,",
+    "  policy/certificate/ID numbers, PAN and Aadhaar numbers with asterisks, leaving",
+    "  only the LAST 3 characters visible. Example: \"Prashant Kumar Singh\" ->",
+    "  \"*****************ngh\"; policy \"2856000112902\" -> \"**********902\".",
+    "- Do NOT mask insurer/company names, product names, or ordinary values like",
+    "  coverage amounts, percentages, dates, or section numbers.",
     "",
     "Context passages:",
     context,
   ].join("\n");
+}
 
-  // 7. Call the chat model with temperature 0.1 for faithful, stable answers.
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+// ===========================================================================
+// ACTION 2 — ASK (STREAMING): question → hybrid retrieve → rerank → stream a
+// grounded, PII-masked answer token-by-token → send citations at the end.
+//
+// Returns a ReadableStream of newline-delimited JSON events:
+//   {"type":"token","text":"..."}                          (answer text, masked)
+//   {"type":"done","citations":[...],"warning":"...","rerankBackend":"..."}
+//   {"type":"error","error":"..."}
+// ===========================================================================
+function askStream(question: string): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (obj: unknown) => controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
+      const warnings: string[] = [];
+      try {
+        // 1. QUERY TRANSFORM — only for short/vague questions (Change: skip when clear).
+        let variants = [question];
+        if (needsRephrase(question)) {
+          const t = await transformQuery(question);
+          if (t.warning) warnings.push(t.warning);
+          variants = t.variants;
+        }
+
+        // 2. Embed all variants in one call.
+        const variantEmbeddings = await embed(variants);
+
+        // 3. HYBRID RETRIEVAL per variant (semantic + keyword), all in parallel.
+        const searches = await Promise.all(
+          variants.flatMap((variant, i) => [
+            supabase.rpc("match_document_chunks", {
+              query_embedding: JSON.stringify(variantEmbeddings[i]),
+              match_count: RETRIEVE_CANDIDATES,
+              min_similarity: SEMANTIC_FLOOR,
+            }),
+            supabase.rpc("match_document_chunks_fts", {
+              query_text: variant,
+              match_count: RETRIEVE_CANDIDATES,
+            }),
+          ]),
+        );
+        for (const r of searches) {
+          if (r.error) throw new Error(`Retrieval failed: ${r.error.message}`);
+        }
+
+        // 4. Fuse all ranked lists with Reciprocal Rank Fusion.
+        const fused = rrf(searches.map((r) => (r.data ?? []) as Chunk[]), RRF_K);
+        if (fused.length === 0) {
+          send({ type: "token", text: NOT_FOUND_MESSAGE });
+          send({ type: "done", citations: [], warning: joinWarnings(warnings) });
+          controller.close();
+          return;
+        }
+
+        // 5. Rerank against the ORIGINAL question; keep the best few.
+        const reranked = await rerank(question, fused.slice(0, RETRIEVE_CANDIDATES), RERANK_TOP_N);
+        if (reranked.warning) warnings.push(reranked.warning);
+        const chunks = reranked.items;
+
+        // 6. Build numbered context + the detailed, mask-aware system prompt.
+        const context = chunks
+          .map((c, i) => `[${i + 1}] (${c.filename}, page ${c.page_number ?? "?"})\n${c.content}`)
+          .join("\n\n---\n\n");
+        const systemPrompt = buildSystemPrompt(context);
+
+        // 7. STREAM the answer from OpenAI. We forward tokens as they arrive, but
+        //    apply the deterministic regex mask to each flushed segment (a safety
+        //    net for structured PII on top of the model's inline masking).
+        const res = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${OPENAI_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: ANSWER_MODEL,
+            temperature: CHAT_TEMPERATURE,
+            stream: true,
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: question },
+            ],
+          }),
+        });
+        if (!res.ok || !res.body) {
+          throw new Error(`OpenAI chat failed: ${res.status} ${res.body ? await res.text() : "(no body)"}`);
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let sseBuf = "";     // raw SSE lines not yet parsed
+        let outBuf = "";     // model text not yet safe to flush (regex needs whole tokens)
+        let fullAnswer = ""; // the masked answer we accumulate for refusal/citation logic
+
+        // Flush emits masked text up to the last whitespace boundary, so a number
+        // or email is never cut in half before the regex mask sees it.
+        const flush = (final: boolean) => {
+          if (!outBuf) return;
+          let upto = outBuf.length;
+          if (!final) {
+            const ws = Math.max(outBuf.lastIndexOf(" "), outBuf.lastIndexOf("\n"));
+            upto = ws >= 0 ? ws + 1 : 0;
+          }
+          if (upto === 0) return;
+          const seg = maskStructured(outBuf.slice(0, upto));
+          outBuf = outBuf.slice(upto);
+          fullAnswer += seg;
+          send({ type: "token", text: seg });
+        };
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          sseBuf += decoder.decode(value, { stream: true });
+          const lines = sseBuf.split("\n");
+          sseBuf = lines.pop() ?? "";
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t.startsWith("data:")) continue;
+            const data = t.slice(5).trim();
+            if (data === "[DONE]") continue;
+            try {
+              const delta = JSON.parse(data).choices?.[0]?.delta?.content;
+              if (typeof delta === "string" && delta) {
+                outBuf += delta;
+                flush(false);
+              }
+            } catch { /* ignore keep-alive / non-JSON lines */ }
+          }
+        }
+        flush(true);
+        const answer = fullAnswer.trim();
+
+        // 8. Refusal → no citations, and we SKIP the snippet scrub (no PII to mask).
+        if (isRefusal(answer)) {
+          send({ type: "done", citations: [], warning: joinWarnings(warnings), rerankBackend: reranked.backend });
+          controller.close();
+          return;
+        }
+
+        // 9. Choose citations from the bracket numbers the model cited (or top-3).
+        const cited = new Set([...answer.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])));
+        const chosen = cited.size > 0 ? chunks.filter((_, i) => cited.has(i + 1)) : chunks.slice(0, 3);
+        const rawSnippets = chosen.map((c) =>
+          c.content.length > 240 ? c.content.slice(0, 240) + "…" : c.content
+        );
+
+        // 10. Mask the snippets deterministically (regex + LLM name/address finder).
+        //     This runs only when there ARE citations (skipped on refusals above).
+        const maskedSnips = await maskOutputs(rawSnippets);
+        if (maskedSnips.warning) warnings.push(maskedSnips.warning);
+        const citations = chosen.map((c, i) => ({
+          document: c.filename,
+          page: c.page_number ?? undefined,
+          snippet: maskedSnips.texts[i],
+        }));
+
+        send({ type: "done", citations, warning: joinWarnings(warnings), rerankBackend: reranked.backend });
+        controller.close();
+      } catch (err) {
+        // Surface any failure to the UI as a stream error event (never silent).
+        send({ type: "error", error: err instanceof Error ? err.message : String(err) });
+        controller.close();
+      }
     },
-    body: JSON.stringify({
-      model: ANSWER_MODEL,
-      temperature: CHAT_TEMPERATURE,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: question },
-      ],
-    }),
   });
-  if (!res.ok) {
-    throw new Error(`OpenAI chat failed: ${res.status} ${await res.text()}`);
-  }
-  const json = await res.json();
-  const answer: string = json.choices?.[0]?.message?.content?.trim() ?? NOT_FOUND_MESSAGE;
+}
 
-  // 8. If the model refused, return no citations. isRefusal() is tolerant of a
-  //    trailing period / casing so a refusal can never slip through and pick up
-  //    a bogus source (the bug behind "refusal WITH a citation").
-  if (isRefusal(answer)) {
-    return { answer: NOT_FOUND_MESSAGE, citations: [], rerankBackend: reranked.backend };
-  }
-
-  // 9. Attach citations. We surface the passages the model actually cited (by
-  //    bracket number); if it answered without brackets, we fall back to the
-  //    top 3 retrieved chunks (already ordered best-first) so the source box
-  //    honestly reflects what grounded the answer.
-  const citedNumbers = new Set(
-    [...answer.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])),
-  );
-  const chosen = citedNumbers.size > 0
-    ? chunks.filter((_, i) => citedNumbers.has(i + 1))
-    : chunks.slice(0, 3);
-
-  const rawCitations = chosen.map((c) => ({
-    document: c.filename,
-    page: c.page_number ?? undefined,
-    snippet: c.content.length > 240 ? c.content.slice(0, 240) + "…" : c.content,
-  }));
-
-  // 10. PII MASKING — the very last step, on OUTPUT ONLY. We mask the answer and
-  //     every citation snippet together in one pass. Everything above this line
-  //     (retrieval, reranking, the model) worked on the REAL text; only what we
-  //     hand back to the browser is redacted. Fails closed (never leaks).
-  const toMask = [answer, ...rawCitations.map((c) => c.snippet)];
-  const masked = await maskOutputs(toMask);
-  if (masked.warning) warnings.push(masked.warning);
-
-  const citations = rawCitations.map((c, i) => ({ ...c, snippet: masked.texts[i + 1] }));
-
-  return {
-    answer: masked.texts[0],
-    citations,
-    warning: warnings.length ? warnings.join(" | ") : undefined,
-    // Diagnostic: which reranker actually ran ("cohere" or "llm"). Lets us confirm
-    // the COHERE_API_KEY path is live; harmless to the UI (ignores unknown fields).
-    rerankBackend: reranked.backend,
-  };
+function joinWarnings(warnings: string[]): string | undefined {
+  return warnings.length ? warnings.join(" | ") : undefined;
 }
 
 // ===========================================================================
@@ -413,14 +489,24 @@ Deno.serve(async (req) => {
     const body = await req.json();
     const action = body.action as "ingest" | "ask";
 
+    // "ask" STREAMS its response (newline-delimited JSON events); "ingest" returns
+    // a single JSON object once processing finishes.
+    if (action === "ask") {
+      const question = (body.question ?? "").toString().trim();
+      if (!question) throw new Error("ask requires a non-empty question");
+      return new Response(askStream(question), {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/x-ndjson; charset=utf-8",
+          "Cache-Control": "no-cache",
+        },
+      });
+    }
+
     let result: unknown;
     if (action === "ingest") {
       if (!body.documentId) throw new Error("ingest requires a documentId");
       result = await ingest(body.documentId);
-    } else if (action === "ask") {
-      const question = (body.question ?? "").toString().trim();
-      if (!question) throw new Error("ask requires a non-empty question");
-      result = await ask(question);
     } else {
       throw new Error(`Unknown action: ${action}. Use "ingest" or "ask".`);
     }

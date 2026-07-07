@@ -27,6 +27,8 @@ function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  // The answer as it streams in, token by token. null = not currently streaming.
+  const [streamingText, setStreamingText] = useState<string | null>(null);
   // Non-fatal notices from the backend (e.g. reranker fell back, PII redaction
   // degraded). Surfaced so nothing fails silently, but not stored in chat history.
   const [warning, setWarning] = useState<string | null>(null);
@@ -46,7 +48,7 @@ function ChatPage() {
 
   useEffect(() => {
     scrollerRef.current?.scrollTo({ top: scrollerRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages]);
+  }, [messages, streamingText]);
 
   async function send() {
     const text = input.trim();
@@ -62,21 +64,70 @@ function ChatPage() {
     });
     await load();
 
-    // Ask the RAG edge function: it embeds the question, retrieves the closest
-    // chunks, and answers strictly from them — returning { answer, citations }.
+    // Ask the RAG edge function. It STREAMS newline-delimited JSON events:
+    //   {type:"token",text}  — answer text, already PII-masked, as it's written
+    //   {type:"done",citations,warning} — final metadata once the answer completes
+    //   {type:"error",error} — a failure to surface
+    // We render tokens live, then persist the finished message to the DB.
+    setStreamingText("");
+    let full = "";
+    let citations: Citation[] = [];
+    let streamError: string | null = null;
+
     try {
-      const { data, error } = await supabase.functions.invoke("rag", {
-        body: { action: "ask", question: text },
+      const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+      const KEY = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/rag`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: KEY,
+          Authorization: `Bearer ${KEY}`,
+        },
+        body: JSON.stringify({ action: "ask", question: text }),
       });
-      if (error) throw error;
-      // Backend returns a structured error instead of throwing on some failures.
-      if (data?.error) throw new Error(data.error);
-      if (data?.warning) setWarning(data.warning);
+      if (!res.ok || !res.body) throw new Error(`Answering service error (${res.status})`);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      const handle = (line: string) => {
+        const t = line.trim();
+        if (!t) return;
+        let ev: { type?: string; text?: string; citations?: Citation[]; warning?: string; error?: string };
+        try {
+          ev = JSON.parse(t);
+        } catch {
+          return; // ignore any partial/non-JSON line
+        }
+        if (ev.type === "token") {
+          full += ev.text ?? "";
+          setStreamingText(full);
+        } else if (ev.type === "done") {
+          citations = ev.citations ?? [];
+          if (ev.warning) setWarning(ev.warning);
+        } else if (ev.type === "error") {
+          streamError = ev.error ?? "Unknown error";
+        }
+      };
+
+      // Read the stream, dispatching each complete newline-delimited event.
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) handle(line);
+      }
+      handle(buf); // trailing event, if any
+
+      if (streamError) throw new Error(streamError);
 
       await supabase.from("chat_messages").insert({
         role: "assistant",
-        content: data?.answer ?? "Something went wrong answering that.",
-        citations: data?.citations ?? [],
+        content: full || "Something went wrong answering that.",
+        citations,
       });
     } catch (e) {
       await supabase.from("chat_messages").insert({
@@ -88,7 +139,8 @@ function ChatPage() {
       });
     }
 
-    await load();
+    await load();          // pull the persisted message into the list…
+    setStreamingText(null); // …then drop the live bubble (avoids a flash-gap)
     setSending(false);
   }
 
@@ -110,8 +162,17 @@ function ChatPage() {
               {messages.map((m) => (
                 <MessageBubble key={m.id} message={m} />
               ))}
-              {sending && (
-                <div className="text-sm text-muted-foreground animate-pulse">Thinking…</div>
+              {streamingText !== null && streamingText.length > 0 ? (
+                <div className="space-y-3">
+                  <div className="text-[15px] leading-relaxed whitespace-pre-wrap">
+                    {streamingText}
+                    <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse rounded-sm bg-primary/70" />
+                  </div>
+                </div>
+              ) : (
+                sending && (
+                  <div className="text-sm text-muted-foreground animate-pulse">Thinking…</div>
+                )
               )}
             </div>
           )}
