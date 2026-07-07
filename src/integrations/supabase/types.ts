@@ -43,9 +43,11 @@ export type Database = {
           chunk_index: number
           content: string
           content_tsv: unknown
+          context_line: string | null
           created_at: string
           document_id: string
           embedding: string | null
+          heading: string | null
           id: string
           page_number: number | null
         }
@@ -53,9 +55,11 @@ export type Database = {
           chunk_index: number
           content: string
           content_tsv?: unknown
+          context_line?: string | null
           created_at?: string
           document_id: string
           embedding?: string | null
+          heading?: string | null
           id?: string
           page_number?: number | null
         }
@@ -63,9 +67,11 @@ export type Database = {
           chunk_index?: number
           content?: string
           content_tsv?: unknown
+          context_line?: string | null
           created_at?: string
           document_id?: string
           embedding?: string | null
+          heading?: string | null
           id?: string
           page_number?: number | null
         }
