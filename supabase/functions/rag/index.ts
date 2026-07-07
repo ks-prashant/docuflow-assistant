@@ -39,11 +39,27 @@ const CHUNK_OVERLAP = 150;    // characters shared between neighbours so we don'
                               // slice a sentence/idea cleanly in half at a boundary
 const EMBED_BATCH_SIZE = 96;  // how many chunks we embed per OpenAI request
 
-const RETRIEVE_TOP_K = 5;     // how many chunks to feed the LLM per question
-const MIN_SIMILARITY = 0.25;  // below this, we treat a chunk as "not really a match"
+const RETRIEVE_TOP_K = 8;     // how many chunks to feed the LLM per question. Broad
+                              // questions ("what is this about?") need several passages
+                              // to synthesize from, so we keep this generous.
+const MIN_SIMILARITY = 0.15;  // below this, a chunk is "not really a match". Kept low so
+                              // vaguely-worded questions still gather relevant context;
+                              // the prompt (not the threshold) decides when to refuse.
 
 // The refusal string is defined once so the prompt and any fallback stay in sync.
 const NOT_FOUND_MESSAGE = "That's not in the provided documents";
+
+/**
+ * Detect whether the model refused, tolerant of the small variations an LLM adds
+ * (a trailing period, different casing, curly vs straight apostrophe). We compare
+ * on a normalized form so a refusal is never mistaken for a real answer — that
+ * mismatch was what previously let a refusal carry a bogus citation.
+ */
+function isRefusal(text: string): boolean {
+  const normalize = (s: string) =>
+    s.trim().toLowerCase().replace(/['’]/g, "'").replace(/[.!\s]+$/, "");
+  return normalize(text) === normalize(NOT_FOUND_MESSAGE);
+}
 
 // Standard CORS headers so the browser app can call this function directly.
 const corsHeaders = {
@@ -244,14 +260,23 @@ async function ask(question: string) {
     .map((c, i) => `[${i + 1}] (${c.filename}, page ${c.page_number ?? "?"})\n${c.content}`)
     .join("\n\n---\n\n");
 
-  // 5. The strict system prompt — this is what keeps the model honest.
+  // 5. The system prompt — this is what keeps the model honest. It is grounded
+  //    (only the passages, no outside knowledge) but NOT extractive-only: the
+  //    model may summarize and synthesize ACROSS the passages, so broad questions
+  //    like "what is this about?" get a real answer instead of a refusal.
   const systemPrompt = [
     "You are a document assistant. Answer the user's question using ONLY the",
     "numbered context passages provided below. Follow these rules exactly:",
-    "1. Use only facts stated in the context. Never use outside knowledge or guess.",
-    `2. If the answer is not contained in the context, reply with exactly: "${NOT_FOUND_MESSAGE}" and nothing else.`,
-    "3. When you do answer, cite the passage(s) you used with their bracket numbers, e.g. [1] or [2].",
-    "4. Be concise and quote the source wording where helpful.",
+    "1. Use only information stated in or directly supported by the passages.",
+    "   Never use outside knowledge and never invent facts.",
+    "2. You MAY combine and summarize across multiple passages to answer broad",
+    "   questions (e.g. what a document is about, or an overview) — as long as",
+    "   every claim is grounded in the passages.",
+    `3. Only if the passages genuinely do not address the question, reply with`,
+    `   exactly: "${NOT_FOUND_MESSAGE}" and nothing else. Do not refuse just`,
+    "   because the answer is spread across passages or not phrased as a summary.",
+    "4. When you answer, cite the passage(s) you used with their bracket numbers,",
+    "   e.g. [1] or [2]. Quote source wording where helpful. Be concise.",
     "",
     "Context passages:",
     context,
@@ -279,20 +304,23 @@ async function ask(question: string) {
   const json = await res.json();
   const answer: string = json.choices?.[0]?.message?.content?.trim() ?? NOT_FOUND_MESSAGE;
 
-  // 7. If the model refused, return no citations (there's no source to show).
-  if (answer === NOT_FOUND_MESSAGE) {
-    return { answer, citations: [] };
+  // 7. If the model refused, return no citations. isRefusal() is tolerant of a
+  //    trailing period / casing so a refusal can never slip through and pick up
+  //    a bogus source (the bug behind "refusal WITH a citation").
+  if (isRefusal(answer)) {
+    return { answer: NOT_FOUND_MESSAGE, citations: [] };
   }
 
   // 8. Attach citations. We surface the passages the model actually cited (by
   //    bracket number); if it answered without brackets, we fall back to the
-  //    single best match so the UI always shows where the answer came from.
+  //    top 3 retrieved chunks (already ordered best-first) so the source box
+  //    honestly reflects what grounded the answer.
   const citedNumbers = new Set(
     [...answer.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])),
   );
   const chosen = citedNumbers.size > 0
     ? chunks.filter((_, i) => citedNumbers.has(i + 1))
-    : [chunks[0]];
+    : chunks.slice(0, 3);
 
   const citations = chosen.map((c) => ({
     document: c.filename,

@@ -2,7 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { AppShell } from "@/components/AppShell";
-import { FileText, Upload, Trash2, Loader2 } from "lucide-react";
+import { FileText, Upload, Trash2, Loader2, RefreshCw } from "lucide-react";
 
 export const Route = createFileRoute("/")({
   component: DocumentsPage,
@@ -29,6 +29,9 @@ function DocumentsPage() {
   const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Tracks which documents are currently being (re)indexed, so we can show a
+  // spinner and disable the button per-row.
+  const [reindexing, setReindexing] = useState<Record<string, boolean>>({});
   const inputRef = useRef<HTMLInputElement>(null);
 
   async function load() {
@@ -113,6 +116,24 @@ function DocumentsPage() {
     await load();
   }
 
+  // Retry processing for a document that never got indexed (e.g. uploaded before
+  // ingestion was wired up, or a run that failed). The edge function's ingest is
+  // idempotent — it clears old chunks first — so this is safe to run repeatedly.
+  async function reindex(doc: Doc) {
+    setReindexing((r) => ({ ...r, [doc.id]: true }));
+    try {
+      const { error } = await supabase.functions.invoke("rag", {
+        body: { action: "ingest", documentId: doc.id },
+      });
+      if (error) throw error;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Re-index failed");
+    } finally {
+      setReindexing((r) => ({ ...r, [doc.id]: false }));
+      await load();
+    }
+  }
+
   return (
     <AppShell>
       <div className="mx-auto max-w-3xl px-6 py-16">
@@ -191,7 +212,10 @@ function DocumentsPage() {
                     <FileText className="h-5 w-5 text-primary" />
                   </div>
                   <div className="min-w-0 flex-1">
-                    <div className="font-medium truncate">{d.filename}</div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium truncate">{d.filename}</span>
+                      <StatusBadge status={d.status} />
+                    </div>
                     <div className="text-xs text-muted-foreground mt-0.5">
                       {formatSize(d.file_size)} ·{" "}
                       {new Date(d.created_at).toLocaleDateString(undefined, {
@@ -201,25 +225,22 @@ function DocumentsPage() {
                       })}
                     </div>
                   </div>
-                  <span
-                    className={
-                      "text-xs px-2 py-1 rounded-full border " +
-                      (d.status === "indexed"
-                        ? "border-primary/30 text-primary bg-primary/5"
-                        : d.status === "failed" || d.status === "no_text"
-                          ? "border-destructive/30 text-destructive bg-destructive/5"
-                          : "border-border text-muted-foreground bg-muted")
-                    }
-                  >
-                    {d.status === "processing" || d.status === "uploaded" ? (
-                      <span className="inline-flex items-center gap-1">
-                        <Loader2 className="h-3 w-3 animate-spin" />
-                        {d.status}
-                      </span>
-                    ) : (
-                      d.status
-                    )}
-                  </span>
+                  {/* Offer a retry for anything that isn't already searchable.
+                      The status pill next to the filename (StatusBadge) shows the
+                      live lifecycle state; this button lets a stuck doc retry. */}
+                  {d.status !== "indexed" && d.status !== "processing" && (
+                    <button
+                      onClick={() => reindex(d)}
+                      disabled={reindexing[d.id]}
+                      className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-muted-foreground hover:text-primary hover:bg-accent transition-colors disabled:opacity-50"
+                      aria-label="Re-index"
+                    >
+                      <RefreshCw
+                        className={"h-3.5 w-3.5 " + (reindexing[d.id] ? "animate-spin" : "")}
+                      />
+                      {reindexing[d.id] ? "Indexing…" : "Re-index"}
+                    </button>
+                  )}
                   <button
                     onClick={() => remove(d)}
                     className="p-2 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
@@ -234,5 +255,36 @@ function DocumentsPage() {
         </div>
       </div>
     </AppShell>
+  );
+}
+
+// Small coloured pill showing where a document is in the ingestion lifecycle:
+// uploaded → processing → indexed, or the failure states failed / no_text.
+function StatusBadge({ status }: { status: string }) {
+  const styles: Record<string, string> = {
+    indexed: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+    processing: "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+    uploaded: "bg-muted text-muted-foreground",
+    failed: "bg-destructive/10 text-destructive",
+    no_text: "bg-destructive/10 text-destructive",
+  };
+  const labels: Record<string, string> = {
+    indexed: "Indexed",
+    processing: "Processing",
+    uploaded: "Not indexed",
+    failed: "Failed",
+    no_text: "No text found",
+  };
+  const style = styles[status] ?? "bg-muted text-muted-foreground";
+  const label = labels[status] ?? status;
+  return (
+    <span
+      className={
+        "shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide " +
+        style
+      }
+    >
+      {label}
+    </span>
   );
 }
