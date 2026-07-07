@@ -21,6 +21,7 @@ export type Database = {
           created_at: string
           id: string
           role: string
+          thread_id: string | null
         }
         Insert: {
           citations?: Json | null
@@ -28,6 +29,7 @@ export type Database = {
           created_at?: string
           id?: string
           role: string
+          thread_id?: string | null
         }
         Update: {
           citations?: Json | null
@@ -35,6 +37,7 @@ export type Database = {
           created_at?: string
           id?: string
           role?: string
+          thread_id?: string | null
         }
         Relationships: []
       }
@@ -120,32 +123,65 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
-      match_document_chunks: {
-        Args: {
-          match_count?: number
-          min_similarity?: number
-          query_embedding: string
-        }
-        Returns: {
-          content: string
-          document_id: string
-          filename: string
-          id: string
-          page_number: number
-          similarity: number
-        }[]
-      }
-      match_document_chunks_fts: {
-        Args: { match_count?: number; query_text: string }
-        Returns: {
-          content: string
-          document_id: string
-          filename: string
-          id: string
-          page_number: number
-          rank: number
-        }[]
-      }
+      match_document_chunks:
+        | {
+            Args: {
+              match_count?: number
+              min_similarity?: number
+              query_embedding: string
+            }
+            Returns: {
+              content: string
+              document_id: string
+              filename: string
+              id: string
+              page_number: number
+              similarity: number
+            }[]
+          }
+        | {
+            Args: {
+              filter_document_id?: string
+              match_count?: number
+              min_similarity?: number
+              query_embedding: string
+            }
+            Returns: {
+              content: string
+              document_id: string
+              filename: string
+              id: string
+              page_number: number
+              similarity: number
+            }[]
+          }
+      match_document_chunks_fts:
+        | {
+            Args: { match_count?: number; query_text: string }
+            Returns: {
+              content: string
+              document_id: string
+              filename: string
+              id: string
+              page_number: number
+              rank: number
+            }[]
+          }
+        | {
+            Args: {
+              filter_document_id?: string
+              match_count?: number
+              query_text: string
+            }
+            Returns: {
+              content: string
+              document_id: string
+              filename: string
+              id: string
+              page_number: number
+              rank: number
+            }[]
+          }
     }
     Enums: {
       [_ in never]: never
