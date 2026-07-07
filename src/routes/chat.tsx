@@ -2,12 +2,12 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { AppShell } from "@/components/AppShell";
-import { ArrowUp, FileText } from "lucide-react";
+import { ArrowUp, FileText, Eraser, ChevronDown } from "lucide-react";
 
 export const Route = createFileRoute("/chat")({
   head: () => ({
     meta: [
-      { title: "Chat — Paperline" },
+      { title: "Chat — DocuFlow" },
       { name: "description", content: "Ask questions across your uploaded documents." },
     ],
   }),
@@ -20,35 +20,85 @@ type Message = {
   role: "user" | "assistant";
   content: string;
   citations: Citation[];
-  created_at: string;
 };
+type IndexedDoc = { id: string; filename: string };
+
+const ALL_DOCS = "__all__";
+
+function newThreadId() {
+  return crypto.randomUUID();
+}
 
 function ChatPage() {
+  // Fresh thread per visit. History is deliberately NOT loaded from the DB —
+  // new messages are still persisted (tagged with this thread id) but old
+  // conversations don't reappear when you open the page.
+  const [threadId, setThreadId] = useState<string>(() => newThreadId());
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
-  // The answer as it streams in, token by token. null = not currently streaming.
   const [streamingText, setStreamingText] = useState<string | null>(null);
-  // Non-fatal notices from the backend (e.g. reranker fell back, PII redaction
-  // degraded). Surfaced so nothing fails silently, but not stored in chat history.
   const [warning, setWarning] = useState<string | null>(null);
+
+  // Document scope. `ALL_DOCS` means "search across every indexed document"
+  // (unchanged retrieval); any other value is a specific document.id that
+  // gets forwarded to the edge function → SQL retrieval filter.
+  const [indexedDocs, setIndexedDocs] = useState<IndexedDoc[]>([]);
+  const [scopeId, setScopeId] = useState<string>(ALL_DOCS);
+
   const scrollerRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  async function load() {
-    const { data } = await supabase
-      .from("chat_messages")
-      .select("*")
-      .order("created_at", { ascending: true });
-    if (data) setMessages(data as Message[]);
-  }
-
+  // Load the list of indexed documents for the selector. Poll modestly so a
+  // newly-indexed doc appears without a manual refresh.
   useEffect(() => {
-    load();
+    let cancelled = false;
+    async function loadDocs() {
+      const { data, error } = await supabase
+        .from("documents")
+        .select("id, filename, status")
+        .eq("status", "indexed")
+        .order("created_at", { ascending: false });
+      if (cancelled) return;
+      if (error) {
+        setWarning(`Couldn't load your document list: ${error.message}`);
+        return;
+      }
+      setIndexedDocs((data ?? []).map((d) => ({ id: d.id, filename: d.filename })));
+    }
+    loadDocs();
+    const t = setInterval(loadDocs, 8000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
   }, []);
 
   useEffect(() => {
     scrollerRef.current?.scrollTo({ top: scrollerRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, streamingText]);
+
+  useEffect(() => {
+    textareaRef.current?.focus();
+  }, [threadId, sending]);
+
+  function resetThread() {
+    setMessages([]);
+    setStreamingText(null);
+    setWarning(null);
+    setThreadId(newThreadId());
+  }
+
+  function onScopeChange(next: string) {
+    if (next === scopeId) return;
+    setScopeId(next);
+    // Switching documents starts a new conversation — otherwise the model
+    // would carry context about one doc into questions about another.
+    resetThread();
+  }
+
+  const scopedDoc = scopeId === ALL_DOCS ? null : indexedDocs.find((d) => d.id === scopeId);
+  const scopeLabel = scopedDoc ? scopedDoc.filename : "All documents";
 
   async function send() {
     const text = input.trim();
@@ -57,18 +107,26 @@ function ChatPage() {
     setInput("");
     setWarning(null);
 
-    await supabase.from("chat_messages").insert({
+    // Optimistic user bubble so the UI updates immediately.
+    const localUser: Message = {
+      id: crypto.randomUUID(),
       role: "user",
       content: text,
       citations: [],
-    });
-    await load();
+    };
+    setMessages((m) => [...m, localUser]);
 
-    // Ask the RAG edge function. It STREAMS newline-delimited JSON events:
-    //   {type:"token",text}  — answer text, already PII-masked, as it's written
-    //   {type:"done",citations,warning} — final metadata once the answer completes
-    //   {type:"error",error} — a failure to surface
-    // We render tokens live, then persist the finished message to the DB.
+    // Persist the user message (tagged with the current thread).
+    const { error: userInsertErr } = await supabase.from("chat_messages").insert({
+      role: "user",
+      content: text,
+      citations: [],
+      thread_id: threadId,
+    });
+    if (userInsertErr) {
+      setWarning(`Couldn't save your message: ${userInsertErr.message}`);
+    }
+
     setStreamingText("");
     let full = "";
     let citations: Citation[] = [];
@@ -84,7 +142,13 @@ function ChatPage() {
           apikey: KEY,
           Authorization: `Bearer ${KEY}`,
         },
-        body: JSON.stringify({ action: "ask", question: text }),
+        body: JSON.stringify({
+          action: "ask",
+          question: text,
+          // Only send documentId when a specific doc is selected. Omitting it
+          // preserves the exact current behavior (search across all docs).
+          ...(scopeId !== ALL_DOCS ? { documentId: scopeId } : {}),
+        }),
       });
       if (!res.ok || !res.body) throw new Error(`Answering service error (${res.status})`);
 
@@ -98,7 +162,7 @@ function ChatPage() {
         try {
           ev = JSON.parse(t);
         } catch {
-          return; // ignore any partial/non-JSON line
+          return;
         }
         if (ev.type === "token") {
           full += ev.text ?? "";
@@ -111,7 +175,6 @@ function ChatPage() {
         }
       };
 
-      // Read the stream, dispatching each complete newline-delimited event.
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -120,41 +183,98 @@ function ChatPage() {
         buf = lines.pop() ?? "";
         for (const line of lines) handle(line);
       }
-      handle(buf); // trailing event, if any
+      handle(buf);
 
       if (streamError) throw new Error(streamError);
 
-      await supabase.from("chat_messages").insert({
+      const assistant: Message = {
+        id: crypto.randomUUID(),
         role: "assistant",
         content: full || "Something went wrong answering that.",
         citations,
+      };
+      setMessages((m) => [...m, assistant]);
+
+      const { error: asstInsertErr } = await supabase.from("chat_messages").insert({
+        role: "assistant",
+        content: assistant.content,
+        citations: assistant.citations,
+        thread_id: threadId,
       });
+      if (asstInsertErr) {
+        setWarning(`Couldn't save the reply: ${asstInsertErr.message}`);
+      }
     } catch (e) {
+      const errText =
+        "I couldn't reach the answering service. " +
+        (e instanceof Error ? e.message : "Please try again.");
+      const assistant: Message = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: errText,
+        citations: [],
+      };
+      setMessages((m) => [...m, assistant]);
+      setWarning(errText);
       await supabase.from("chat_messages").insert({
         role: "assistant",
-        content:
-          "I couldn't reach the answering service. " +
-          (e instanceof Error ? e.message : "Please try again."),
+        content: errText,
         citations: [],
+        thread_id: threadId,
       });
     }
 
-    await load();          // pull the persisted message into the list…
-    setStreamingText(null); // …then drop the live bubble (avoids a flash-gap)
+    setStreamingText(null);
     setSending(false);
   }
 
   return (
     <AppShell>
       <div className="mx-auto max-w-3xl px-6 h-[calc(100vh-4rem)] flex flex-col">
-        <div ref={scrollerRef} className="flex-1 overflow-y-auto py-10">
+        {/* Scope + Clear controls */}
+        <div className="pt-6 pb-2 flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-xs uppercase tracking-wider text-muted-foreground shrink-0">
+              Answering from:
+            </span>
+            <div className="relative">
+              <select
+                value={scopeId}
+                onChange={(e) => onScopeChange(e.target.value)}
+                className="appearance-none rounded-lg border border-border bg-card pl-3 pr-8 py-1.5 text-sm font-medium hover:border-primary/50 focus:outline-none focus:ring-2 focus:ring-primary/20 max-w-[280px] truncate"
+                aria-label="Choose which document to chat with"
+              >
+                <option value={ALL_DOCS}>All documents</option>
+                {indexedDocs.map((d) => (
+                  <option key={d.id} value={d.id}>
+                    {d.filename}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+            </div>
+          </div>
+          {messages.length > 0 && (
+            <button
+              onClick={resetThread}
+              className="flex items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground hover:border-primary/50 transition-colors"
+              aria-label="Clear chat"
+            >
+              <Eraser className="h-3.5 w-3.5" />
+              Clear chat
+            </button>
+          )}
+        </div>
+
+        <div ref={scrollerRef} className="flex-1 overflow-y-auto py-6">
           {messages.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-center">
               <h1 className="font-display text-5xl leading-tight">
                 Ask your documents anything
               </h1>
               <p className="mt-4 text-muted-foreground max-w-md">
-                Answers appear with citations to the exact passage in your PDFs.
+                Answers appear with citations to the exact passage. Currently answering
+                from <span className="text-foreground font-medium">{scopeLabel}</span>.
               </p>
             </div>
           ) : (
@@ -200,6 +320,7 @@ function ChatPage() {
             className="relative rounded-2xl border border-border bg-card shadow-sm focus-within:border-primary/60 focus-within:ring-4 focus-within:ring-primary/10 transition"
           >
             <textarea
+              ref={textareaRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
@@ -209,7 +330,11 @@ function ChatPage() {
                 }
               }}
               rows={2}
-              placeholder="Ask a question about your documents…"
+              placeholder={
+                scopedDoc
+                  ? `Ask about ${scopedDoc.filename}…`
+                  : "Ask a question about your documents…"
+              }
               className="w-full resize-none bg-transparent px-5 py-4 pr-14 text-[15px] outline-none placeholder:text-muted-foreground"
             />
             <button
@@ -257,7 +382,7 @@ function SourceBlock({ citations }: { citations: Citation[] }) {
       </div>
       {citations.length === 0 ? (
         <div className="mt-2 text-sm text-muted-foreground italic">
-          No source yet — citations will appear here once AI answering is enabled.
+          No source cited for this reply.
         </div>
       ) : (
         <ul className="mt-2 space-y-2">
