@@ -40,10 +40,10 @@ const EMBEDDING_MODEL = "text-embedding-3-small"; // 1536 dims → matches our v
 // Two model tiers (Change 7): a stronger model writes the final answer; a cheap
 // model does the many helper steps (query transform, context generation, LLM
 // rerank fallback, PII redaction). Switch the answer model here in one place.
-const ANSWER_MODEL = "gpt-4o-mini";  // final answer — fast + cheap; a detailed prompt
-                                     // carries answer quality. Switch here in one place.
+const ANSWER_MODEL = "gpt-4o";       // final grounded answer — stronger synthesis,
+                                     // fewer false refusals. Switch here in one place.
                                      // (Helper steps — query transform, context gen,
-                                     // rerank fallback, snippet redaction — also use
+                                     // rerank fallback, PII span extraction — use
                                      // gpt-4o-mini, set inside their own modules.)
 const CHAT_TEMPERATURE = 0.1;        // low = faithful, repeatable answers
 
@@ -257,49 +257,24 @@ function rrf(lists: Chunk[][], k: number): Chunk[] {
   return [...byId.values()].sort((a, b) => score.get(b.id)! - score.get(a.id)!);
 }
 
-// Decide whether a question needs the (latency-adding) query-transform step.
-// Long, specific questions are usually self-sufficient, so we skip the rewrite to
-// save ~0.5–1.5s. Short or vaguely-worded ones ("whose policy is this?") benefit
-// from jargon expansion, so we keep it for them.
-function needsRephrase(question: string): boolean {
-  const words = question.trim().split(/\s+/).filter(Boolean);
-  if (words.length <= 6) return true;                              // short → expand
-  if (words.length < 10 && /\b(this|that|these|those|it|whose|they|there)\b/i.test(question)) {
-    return true;                                                   // vague reference → expand
-  }
-  return false;                                                    // long & specific → skip
-}
-
-// The answer instructions. Detailed on HOW to write a good grounded answer, and —
-// because answers now STREAM token-by-token — it masks personal data INLINE as it
-// writes (so nothing unmasked ever reaches the browser). A deterministic regex net
-// on the outgoing stream still guarantees the structured PII types.
+// The system prompt — grounded (only the passages, no outside knowledge) but not
+// extractive-only: the model may summarize and synthesize across passages. PII is
+// masked deterministically AFTER generation (stored name/address spans + regex on
+// the stream), so the prompt stays focused on answering.
 function buildSystemPrompt(context: string): string {
   return [
-    "You are a meticulous insurance-document assistant. Answer the user's question",
-    "using ONLY the numbered context passages below.",
-    "",
-    "HOW TO ANSWER WELL:",
-    "- Ground every statement in the passages. Never use outside knowledge or guess.",
-    "- Start with a direct answer to the exact question, then the key supporting detail.",
-    "- You MAY combine and summarize across passages for broad questions.",
-    "- Preserve specifics exactly: numbers, percentages, monetary limits, time periods,",
-    "  and section names (e.g. \"1% of Sum Insured per day\", \"Section B.3\").",
-    "- When values come from a table/sub-limit list, pair each value with what it applies to.",
-    "- Format with brief markdown: a lead sentence, then bullet points for multiple values.",
-    "  Be concise — no filler, no repeating the question.",
-    "- Cite the passages you used with bracket numbers like [1], [2].",
-    `- ONLY if the passages genuinely do not address the question, reply with EXACTLY`,
-    `  "${NOT_FOUND_MESSAGE}" and nothing else. Do not refuse just because the answer is`,
-    "  spread across passages or not phrased as a summary.",
-    "",
-    "PRIVACY — mask personal data IN YOUR ANSWER as you write it:",
-    "- Replace person names, full postal addresses, phone numbers, email addresses,",
-    "  policy/certificate/ID numbers, PAN and Aadhaar numbers with asterisks, leaving",
-    "  only the LAST 3 characters visible. Example: \"Prashant Kumar Singh\" ->",
-    "  \"*****************ngh\"; policy \"2856000112902\" -> \"**********902\".",
-    "- Do NOT mask insurer/company names, product names, or ordinary values like",
-    "  coverage amounts, percentages, dates, or section numbers.",
+    "You are a document assistant. Answer the user's question using ONLY the",
+    "numbered context passages provided below. Follow these rules exactly:",
+    "1. Use only information stated in or directly supported by the passages.",
+    "   Never use outside knowledge and never invent facts.",
+    "2. You MAY combine and summarize across multiple passages to answer broad",
+    "   questions (e.g. what a document is about, or an overview) — as long as",
+    "   every claim is grounded in the passages.",
+    `3. Only if the passages genuinely do not address the question, reply with`,
+    `   exactly: "${NOT_FOUND_MESSAGE}" and nothing else. Do not refuse just`,
+    "   because the answer is spread across passages or not phrased as a summary.",
+    "4. When you answer, cite the passage(s) you used with their bracket numbers,",
+    "   e.g. [1] or [2]. Quote source wording where helpful. Be concise.",
     "",
     "Context passages:",
     context,
@@ -322,13 +297,11 @@ function askStream(question: string): ReadableStream<Uint8Array> {
       const send = (obj: unknown) => controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
       const warnings: string[] = [];
       try {
-        // 1. QUERY TRANSFORM — only for short/vague questions (Change: skip when clear).
-        let variants = [question];
-        if (needsRephrase(question)) {
-          const t = await transformQuery(question);
-          if (t.warning) warnings.push(t.warning);
-          variants = t.variants;
-        }
+        // 1. QUERY TRANSFORM — always expand the question into 2–3 search variants
+        //    (jargon/synonyms + vague→concrete). Falls back to the original on failure.
+        const t = await transformQuery(question);
+        if (t.warning) warnings.push(t.warning);
+        const variants = t.variants;
 
         // 2. Embed all variants in one call.
         const variantEmbeddings = await embed(variants);
