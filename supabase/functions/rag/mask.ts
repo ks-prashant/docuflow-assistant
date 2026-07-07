@@ -12,7 +12,9 @@
 //   1. Regex layer (deterministic, high precision) for STRUCTURED data — phone,
 //      email, long/grouped numeric IDs (policy/certificate), PAN, Aadhaar.
 //   2. LLM layer (gpt-4o-mini, temperature 0) for names + full street addresses,
-//      which regex handles poorly. It returns the text unchanged except PII.
+//      which regex handles poorly. The model only IDENTIFIES the PII spans; we
+//      apply the deterministic maskValue() ourselves, so the tail-3 formatting is
+//      guaranteed and a name is never partially left visible.
 //
 // Fail-closed: if the LLM layer errors or misbehaves, we still return the
 // regex-masked text (structured PII already hidden) plus a warning — we never
@@ -61,18 +63,18 @@ export function maskStructured(text: string): string {
 }
 
 // --- Layer 2: LLM redaction for names + addresses ----------------------------
-// One batched call redacts an array of texts at once (answer + each snippet).
-async function llmRedactBatch(texts: string[]): Promise<string[]> {
+// We do NOT ask the model to rewrite the text (LLMs apply the char-level mask
+// inconsistently — e.g. leaving a surname visible). Instead the model only
+// IDENTIFIES the name/address spans, and we apply the deterministic maskValue()
+// ourselves. That guarantees the tail-3 formatting and never partially leaks.
+async function findNameAddressSpans(texts: string[]): Promise<string[]> {
   const prompt =
-    `You are a redaction filter. For each input string, replace ONLY personal ` +
-    `names and full street/postal addresses with asterisks, keeping the LAST ` +
-    `${VISIBLE_TAIL} characters of each masked value visible ` +
-    `(e.g. "Prashant Singh" -> "*********ngh"). Do NOT change anything else — ` +
-    `keep all other characters, numbers, punctuation, and existing asterisks ` +
-    `byte-for-byte identical. Do not add commentary.\n` +
-    `Return ONLY JSON: {"out": ["<redacted 0>", "<redacted 1>", ...]} with the ` +
-    `same number of items, in the same order.\n\n` +
-    `INPUTS:\n${JSON.stringify(texts)}`;
+    `Find every PERSON NAME and every FULL STREET/POSTAL ADDRESS in the texts ` +
+    `below. Return each exactly as it appears (verbatim substrings), including ` +
+    `every variant (full name and any shorter mention). Do NOT include company / ` +
+    `insurer names, product names, or a city/state/country on its own.\n` +
+    `Return ONLY JSON: {"pii": ["...", "..."]} (empty array if none).\n\n` +
+    `TEXTS:\n${JSON.stringify(texts)}`;
 
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -90,28 +92,34 @@ async function llmRedactBatch(texts: string[]): Promise<string[]> {
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   const json = await res.json();
   const parsed = JSON.parse(json.choices?.[0]?.message?.content ?? "{}");
-  const out = parsed.out;
-  // Guard: the model must return exactly one redacted string per input, else we
-  // can't trust the mapping — treat as failure so the caller falls back safely.
-  if (!Array.isArray(out) || out.length !== texts.length || out.some((s) => typeof s !== "string")) {
-    throw new Error("LLM redaction returned an unexpected shape");
-  }
-  return out as string[];
+  const pii = parsed.pii;
+  if (!Array.isArray(pii)) throw new Error("PII finder returned an unexpected shape");
+  // Dedupe, drop empties/very short tokens, and mask longer spans first so a full
+  // name is masked before a bare surname (avoids double-masking artifacts).
+  return [...new Set(pii.filter((s): s is string => typeof s === "string" && s.trim().length >= 2))]
+    .sort((a, b) => b.length - a.length);
+}
+
+/** Replace every occurrence of each span with its deterministically-masked form. */
+function maskSpans(text: string, spans: string[]): string {
+  let out = text;
+  for (const span of spans) out = out.split(span).join(maskValue(span));
+  return out;
 }
 
 /**
  * Mask an array of outgoing texts (answer + citation snippets).
- * Order matters: regex first (always applied), then the LLM name/address pass on
- * the regex-masked text. Fail-closed — on any LLM problem we return the
- * regex-masked text and a warning, never the raw text.
+ * Regex first (always applied, deterministic), then mask the LLM-identified name /
+ * address spans with the same maskValue(). Fail-closed — on any LLM problem we
+ * return the regex-masked text and a warning, never the raw text.
  */
 export async function maskOutputs(
   texts: string[],
 ): Promise<{ texts: string[]; warning?: string }> {
   const structured = texts.map(maskStructured);
   try {
-    const redacted = await llmRedactBatch(structured);
-    return { texts: redacted };
+    const spans = await findNameAddressSpans(structured);
+    return { texts: structured.map((t) => maskSpans(t, spans)) };
   } catch (err) {
     return {
       texts: structured, // structured PII is still masked — we never leak those

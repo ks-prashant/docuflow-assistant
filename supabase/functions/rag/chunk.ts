@@ -51,22 +51,12 @@ function isHeading(line: string): boolean {
 }
 
 /**
- * A "block" is a run of consecutive non-empty lines (a paragraph, a table, or a
- * list). We split on blank lines. Blocks are the atomic unit we never break across
- * chunks — that is what keeps a table's rows with their header.
- */
-function splitIntoBlocks(pageText: string): string[] {
-  return pageText
-    .replace(/\r\n?/g, "\n")
-    .split(/\n{2,}|\n(?=\s*$)/)   // blank-line boundaries
-    .map((b) => b.replace(/[ \t]+\n/g, "\n").trim())
-    .filter((b) => b.length > 0);
-}
-
-/**
- * Chunk one page. `targetSize` is the soft prose target; `overlap` re-includes the
- * tail of the previous chunk for prose continuity. Blocks are never split; a block
- * larger than the target becomes its own (over-sized) chunk rather than being cut.
+ * Chunk one page at the LINE level. The PDF extractor gives us single line breaks
+ * but no blank-line paragraph structure, so we group whole lines up to `targetSize`
+ * and only ever break BETWEEN lines — never mid-line. Since each table row is its
+ * own line, rows are never cut in half (a big table may still span two chunks, but
+ * always at a row boundary). Each chunk carries the nearest heading seen so far,
+ * and `overlap` re-includes the previous chunk's tail lines for continuity.
  */
 export function chunkPage(
   pageText: string,
@@ -76,45 +66,43 @@ export function chunkPage(
   const clean = (pageText ?? "").replace(/\r\n?/g, "\n");
   if (!clean.trim()) return [];
 
-  const blocks = splitIntoBlocks(clean);
+  const lines = clean.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
   const chunks: PageChunk[] = [];
 
   let currentHeading: string | null = null;
-  let buf = "";
+  let buf: string[] = [];       // lines in the current chunk
+  let bufLen = 0;               // approx char length of buf
   let bufHeading: string | null = null;
 
   const flush = () => {
-    const text = buf.trim();
+    const text = buf.join("\n").trim();
     if (text) chunks.push({ content: text, heading: bufHeading });
-    buf = "";
+    buf = [];
+    bufLen = 0;
   };
 
-  for (const block of blocks) {
-    // A block that is ONLY a heading updates context but isn't a chunk on its own.
-    const lines = block.split("\n").map((l) => l.trim()).filter(Boolean);
-    if (lines.length === 1 && isHeading(lines[0])) {
+  for (const line of lines) {
+    // Track the nearest heading. isStrongHeading catches "Section B.3"/ALL-CAPS/
+    // numbered; the soft rule also catches a short Title Case line on its own.
+    if (isHeading(line)) currentHeading = line;
+
+    // Overflow → close the current chunk, carrying the tail lines as overlap.
+    if (bufLen > 0 && bufLen + line.length + 1 > targetSize) {
+      const carried: string[] = [];
+      let carriedLen = 0;
+      for (let k = buf.length - 1; k >= 0 && carriedLen < overlap; k--) {
+        carried.unshift(buf[k]);
+        carriedLen += buf[k].length + 1;
+      }
       flush();
-      currentHeading = lines[0];
-      continue;
-    }
-    // If a multi-line block starts with a STRONG heading, adopt it (but ignore
-    // soft title-case first lines, which are usually table row labels).
-    if (lines.length > 1 && isStrongHeading(lines[0])) {
-      currentHeading = lines[0];
+      buf = [...carried];
+      bufLen = carriedLen;
+      bufHeading = currentHeading;
     }
 
-    // Start a fresh chunk if adding this block would overflow the prose target
-    // (but never split the block itself).
-    if (buf && (buf.length + block.length + 1) > targetSize) {
-      const tail = overlap > 0 ? buf.slice(-overlap) : "";
-      flush();
-      buf = tail ? tail + "\n" : "";
-    }
-    if (!buf) bufHeading = currentHeading; // record the heading this chunk opened under
-    buf += (buf ? "\n" : "") + block;
-
-    // A single block bigger than the target is its own chunk (don't cut a table).
-    if (buf.length >= targetSize) flush();
+    if (buf.length === 0) bufHeading = currentHeading;
+    buf.push(line);
+    bufLen += line.length + 1;
   }
   flush();
 
