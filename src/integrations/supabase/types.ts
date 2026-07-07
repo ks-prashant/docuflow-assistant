@@ -92,6 +92,7 @@ export type Database = {
           file_size: number | null
           filename: string
           id: string
+          pii_spans: Json
           status: string
         }
         Insert: {
@@ -100,6 +101,7 @@ export type Database = {
           file_size?: number | null
           filename: string
           id?: string
+          pii_spans?: Json
           status?: string
         }
         Update: {
@@ -108,6 +110,7 @@ export type Database = {
           file_size?: number | null
           filename?: string
           id?: string
+          pii_spans?: Json
           status?: string
         }
         Relationships: []
