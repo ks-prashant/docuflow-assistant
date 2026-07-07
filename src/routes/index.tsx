@@ -201,6 +201,25 @@ function DocumentsPage() {
                       })}
                     </div>
                   </div>
+                  <span
+                    className={
+                      "text-xs px-2 py-1 rounded-full border " +
+                      (d.status === "indexed"
+                        ? "border-primary/30 text-primary bg-primary/5"
+                        : d.status === "failed" || d.status === "no_text"
+                          ? "border-destructive/30 text-destructive bg-destructive/5"
+                          : "border-border text-muted-foreground bg-muted")
+                    }
+                  >
+                    {d.status === "processing" || d.status === "uploaded" ? (
+                      <span className="inline-flex items-center gap-1">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        {d.status}
+                      </span>
+                    ) : (
+                      d.status
+                    )}
+                  </span>
                   <button
                     onClick={() => remove(d)}
                     className="p-2 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
