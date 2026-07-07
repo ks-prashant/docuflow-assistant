@@ -42,6 +42,8 @@ function DocumentsPage() {
 
   useEffect(() => {
     load();
+    const t = setInterval(load, 3000);
+    return () => clearInterval(t);
   }, []);
 
   async function handleFiles(files: FileList | null) {
