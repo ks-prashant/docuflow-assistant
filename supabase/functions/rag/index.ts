@@ -1,0 +1,346 @@
+// =============================================================================
+// RAG core — a single, self-contained edge function.
+//
+// This one module is the entire "AI brain" of the app. It exposes two actions:
+//
+//   • action: "ingest"  → take an uploaded PDF, split it into chunks, embed each
+//                          chunk with OpenAI, and store the vectors in Postgres.
+//   • action: "ask"     → embed the user's question, retrieve ONLY the closest
+//                          chunks, and let the LLM answer strictly from those.
+//
+// Design promises (the things you'd defend to a client):
+//   1. The model NEVER sees your whole library — only the handful of chunks the
+//      vector search returns for this specific question. That is the core of
+//      Retrieval-Augmented Generation: ground the answer in retrieved evidence.
+//   2. The system prompt forbids outside knowledge and requires a citation, and
+//      the model is told to say "That's not in the provided documents" when the
+//      retrieved chunks don't contain the answer.
+//   3. temperature = 0.1 → near-deterministic, faithful answers, not creative ones.
+//   4. The OpenAI key is read from a secret (Deno.env), never hardcoded.
+//
+// SECRET REQUIRED:  OPENAI_API_KEY   (add it in Lovable Cloud → project secrets)
+// =============================================================================
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+// unpdf is a serverless-friendly build of Mozilla's pdf.js — it extracts text
+// from a PDF without native binaries, which is exactly what a Deno edge runtime
+// needs. We ask it for text PER PAGE so every chunk can carry a page number.
+import { extractText, getDocumentProxy } from "https://esm.sh/unpdf@0.12.1";
+
+// ---------------------------------------------------------------------------
+// Configuration — all the knobs in one place so they're easy to explain/tune.
+// ---------------------------------------------------------------------------
+const EMBEDDING_MODEL = "text-embedding-3-small"; // 1536 dims → matches our vector column
+const CHAT_MODEL = "gpt-4o-mini";                 // cheap, strong instruction-following
+const CHAT_TEMPERATURE = 0.1;                      // low = faithful, repeatable answers
+
+const CHUNK_SIZE = 1000;      // ~target characters per chunk (a few paragraphs)
+const CHUNK_OVERLAP = 150;    // characters shared between neighbours so we don't
+                              // slice a sentence/idea cleanly in half at a boundary
+const EMBED_BATCH_SIZE = 96;  // how many chunks we embed per OpenAI request
+
+const RETRIEVE_TOP_K = 5;     // how many chunks to feed the LLM per question
+const MIN_SIMILARITY = 0.25;  // below this, we treat a chunk as "not really a match"
+
+// The refusal string is defined once so the prompt and any fallback stay in sync.
+const NOT_FOUND_MESSAGE = "That's not in the provided documents";
+
+// Standard CORS headers so the browser app can call this function directly.
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+// ---------------------------------------------------------------------------
+// Clients / secrets.
+//
+// Lovable Cloud auto-injects SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY into
+// every edge function. We use the SERVICE ROLE key here (not the public key)
+// because this trusted server code needs to read storage and write embeddings
+// on the user's behalf. OPENAI_API_KEY is the one secret YOU must add.
+// ---------------------------------------------------------------------------
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+
+// ===========================================================================
+// OpenAI helpers
+// ===========================================================================
+
+/**
+ * Embed one or more texts with text-embedding-3-small.
+ * Returns one 1536-number vector per input, in the same order.
+ */
+async function embed(inputs: string[]): Promise<number[][]> {
+  const res = await fetch("https://api.openai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ model: EMBEDDING_MODEL, input: inputs }),
+  });
+  if (!res.ok) {
+    throw new Error(`OpenAI embeddings failed: ${res.status} ${await res.text()}`);
+  }
+  const json = await res.json();
+  // The API preserves input order but also returns an index; sort to be safe.
+  return json.data
+    .sort((a: { index: number }, b: { index: number }) => a.index - b.index)
+    .map((d: { embedding: number[] }) => d.embedding);
+}
+
+// ===========================================================================
+// Text chunking
+//
+// LLMs and embeddings work best on bite-sized passages, and small chunks make
+// citations precise ("this paragraph on page 4" beats "somewhere in this file").
+// We split each PAGE independently so a chunk never straddles two pages and its
+// page_number stays truthful. Overlap keeps ideas that sit on a boundary intact.
+// ===========================================================================
+function chunkText(text: string): string[] {
+  const clean = text.replace(/\s+/g, " ").trim();
+  if (!clean) return [];
+
+  const chunks: string[] = [];
+  let start = 0;
+  while (start < clean.length) {
+    let end = Math.min(start + CHUNK_SIZE, clean.length);
+
+    // Prefer to end a chunk at a sentence/space boundary near the target size,
+    // rather than mid-word, so chunks read naturally.
+    if (end < clean.length) {
+      const window = clean.slice(start, end);
+      const lastBreak = Math.max(
+        window.lastIndexOf(". "),
+        window.lastIndexOf("? "),
+        window.lastIndexOf("! "),
+        window.lastIndexOf("\n"),
+      );
+      if (lastBreak > CHUNK_SIZE * 0.5) end = start + lastBreak + 1;
+    }
+
+    const piece = clean.slice(start, end).trim();
+    if (piece) chunks.push(piece);
+
+    if (end >= clean.length) break;
+    start = end - CHUNK_OVERLAP; // step back so the next chunk overlaps this one
+  }
+  return chunks;
+}
+
+// ===========================================================================
+// ACTION 1 — INGEST: PDF  →  chunks  →  embeddings  →  Postgres
+// ===========================================================================
+async function ingest(documentId: string) {
+  // 1. Look up the document row the frontend created on upload.
+  const { data: doc, error: docErr } = await supabase
+    .from("documents")
+    .select("id, filename, file_path")
+    .eq("id", documentId)
+    .single();
+  if (docErr || !doc) throw new Error(`Document not found: ${documentId}`);
+
+  // Mark it "processing" so the UI can show progress and we can tell if a run
+  // died halfway. We also clear any old chunks so re-ingesting is idempotent.
+  await supabase.from("documents").update({ status: "processing" }).eq("id", documentId);
+  await supabase.from("document_chunks").delete().eq("document_id", documentId);
+
+  try {
+    // 2. Download the raw PDF bytes from the 'documents' storage bucket.
+    const { data: file, error: dlErr } = await supabase
+      .storage.from("documents").download(doc.file_path);
+    if (dlErr || !file) throw new Error(`Could not download PDF: ${dlErr?.message}`);
+    const bytes = new Uint8Array(await file.arrayBuffer());
+
+    // 3. Extract text, one string per page (mergePages: false keeps pages split).
+    const pdf = await getDocumentProxy(bytes);
+    const { text: pages } = await extractText(pdf, { mergePages: false });
+    const pageTexts: string[] = Array.isArray(pages) ? pages : [pages];
+
+    // 4. Chunk every page, remembering which page each chunk came from.
+    const records: { content: string; page_number: number }[] = [];
+    pageTexts.forEach((pageText, i) => {
+      for (const content of chunkText(pageText ?? "")) {
+        records.push({ content, page_number: i + 1 }); // pages are 1-indexed for humans
+      }
+    });
+
+    if (records.length === 0) {
+      // A scanned/image-only PDF yields no extractable text — flag it clearly
+      // instead of silently indexing nothing.
+      await supabase.from("documents").update({ status: "no_text" }).eq("id", documentId);
+      return { documentId, chunks: 0, note: "No extractable text (is this a scanned PDF?)" };
+    }
+
+    // 5. Embed the chunks in batches, then store each chunk + its vector.
+    let chunkIndex = 0;
+    for (let i = 0; i < records.length; i += EMBED_BATCH_SIZE) {
+      const batch = records.slice(i, i + EMBED_BATCH_SIZE);
+      const vectors = await embed(batch.map((r) => r.content));
+
+      const rows = batch.map((r, j) => ({
+        document_id: documentId,
+        chunk_index: chunkIndex++,
+        content: r.content,
+        page_number: r.page_number,
+        // pgvector accepts its text form "[0.1,0.2,...]", which is exactly what
+        // JSON.stringify(array) produces — so we store the vector as a string.
+        embedding: JSON.stringify(vectors[j]),
+      }));
+
+      const { error: insErr } = await supabase.from("document_chunks").insert(rows);
+      if (insErr) throw new Error(`Failed to store chunks: ${insErr.message}`);
+    }
+
+    // 6. Done — the document is now searchable.
+    await supabase.from("documents").update({ status: "indexed" }).eq("id", documentId);
+    return { documentId, chunks: records.length };
+  } catch (err) {
+    // Never leave a document stuck on "processing"; record the failure.
+    await supabase.from("documents").update({ status: "failed" }).eq("id", documentId);
+    throw err;
+  }
+}
+
+// ===========================================================================
+// ACTION 2 — ASK: question  →  retrieve top chunks  →  grounded answer
+// ===========================================================================
+async function ask(question: string) {
+  // 1. Turn the question into the same kind of vector as our chunks.
+  const [questionEmbedding] = await embed([question]);
+
+  // 2. Ask Postgres for the closest chunks (see the SQL migration). This is the
+  //    "R" in RAG — everything the model is allowed to use comes from here.
+  const { data: matches, error: matchErr } = await supabase.rpc(
+    "match_document_chunks",
+    {
+      query_embedding: JSON.stringify(questionEmbedding),
+      match_count: RETRIEVE_TOP_K,
+      min_similarity: MIN_SIMILARITY,
+    },
+  );
+  if (matchErr) throw new Error(`Retrieval failed: ${matchErr.message}`);
+
+  type Match = {
+    id: string; document_id: string; content: string;
+    page_number: number | null; filename: string; similarity: number;
+  };
+  const chunks = (matches ?? []) as Match[];
+
+  // 3. Hard guardrail: if nothing cleared the similarity bar, we don't even call
+  //    the LLM. No relevant context ⇒ the honest answer is the refusal string.
+  if (chunks.length === 0) {
+    return { answer: NOT_FOUND_MESSAGE, citations: [] };
+  }
+
+  // 4. Build a numbered context block. Numbering lets the model cite "[1]", and
+  //    lets us map that citation back to a real file + page for the UI.
+  const context = chunks
+    .map((c, i) => `[${i + 1}] (${c.filename}, page ${c.page_number ?? "?"})\n${c.content}`)
+    .join("\n\n---\n\n");
+
+  // 5. The strict system prompt — this is what keeps the model honest.
+  const systemPrompt = [
+    "You are a document assistant. Answer the user's question using ONLY the",
+    "numbered context passages provided below. Follow these rules exactly:",
+    "1. Use only facts stated in the context. Never use outside knowledge or guess.",
+    `2. If the answer is not contained in the context, reply with exactly: "${NOT_FOUND_MESSAGE}" and nothing else.`,
+    "3. When you do answer, cite the passage(s) you used with their bracket numbers, e.g. [1] or [2].",
+    "4. Be concise and quote the source wording where helpful.",
+    "",
+    "Context passages:",
+    context,
+  ].join("\n");
+
+  // 6. Call the chat model with temperature 0.1 for faithful, stable answers.
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: CHAT_MODEL,
+      temperature: CHAT_TEMPERATURE,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: question },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`OpenAI chat failed: ${res.status} ${await res.text()}`);
+  }
+  const json = await res.json();
+  const answer: string = json.choices?.[0]?.message?.content?.trim() ?? NOT_FOUND_MESSAGE;
+
+  // 7. If the model refused, return no citations (there's no source to show).
+  if (answer === NOT_FOUND_MESSAGE) {
+    return { answer, citations: [] };
+  }
+
+  // 8. Attach citations. We surface the passages the model actually cited (by
+  //    bracket number); if it answered without brackets, we fall back to the
+  //    single best match so the UI always shows where the answer came from.
+  const citedNumbers = new Set(
+    [...answer.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])),
+  );
+  const chosen = citedNumbers.size > 0
+    ? chunks.filter((_, i) => citedNumbers.has(i + 1))
+    : [chunks[0]];
+
+  const citations = chosen.map((c) => ({
+    document: c.filename,
+    page: c.page_number ?? undefined,
+    snippet: c.content.length > 240 ? c.content.slice(0, 240) + "…" : c.content,
+  }));
+
+  return { answer, citations };
+}
+
+// ===========================================================================
+// HTTP entrypoint — routes a single POST to the right action.
+// ===========================================================================
+Deno.serve(async (req) => {
+  // Browser preflight.
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    // Fail fast and loud if the required secret is missing.
+    if (!OPENAI_API_KEY) {
+      throw new Error("Missing secret OPENAI_API_KEY. Add it in Lovable Cloud project secrets.");
+    }
+
+    const body = await req.json();
+    const action = body.action as "ingest" | "ask";
+
+    let result: unknown;
+    if (action === "ingest") {
+      if (!body.documentId) throw new Error("ingest requires a documentId");
+      result = await ingest(body.documentId);
+    } else if (action === "ask") {
+      const question = (body.question ?? "").toString().trim();
+      if (!question) throw new Error("ask requires a non-empty question");
+      result = await ask(question);
+    } else {
+      throw new Error(`Unknown action: ${action}. Use "ingest" or "ask".`);
+    }
+
+    return new Response(JSON.stringify(result), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    console.error("[rag] error:", err);
+    return new Response(
+      JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+      { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+    );
+  }
+});

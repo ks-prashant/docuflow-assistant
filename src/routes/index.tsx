@@ -59,13 +59,28 @@ function DocumentsPage() {
           .from("documents")
           .upload(path, file, { contentType: "application/pdf" });
         if (upErr) throw upErr;
-        const { error: insErr } = await supabase.from("documents").insert({
-          filename: file.name,
-          file_path: path,
-          file_size: file.size,
-          status: "uploaded",
-        });
+        const { data: inserted, error: insErr } = await supabase
+          .from("documents")
+          .insert({
+            filename: file.name,
+            file_path: path,
+            file_size: file.size,
+            status: "uploaded",
+          })
+          .select()
+          .single();
         if (insErr) throw insErr;
+
+        // Kick off server-side processing: the edge function chunks the PDF,
+        // creates embeddings, and stores them. We don't await the whole job in a
+        // blocking way for the UI — status on the row moves uploaded → processing
+        // → indexed, and load() below reflects the latest state.
+        if (inserted) {
+          supabase.functions
+            .invoke("rag", { body: { action: "ingest", documentId: inserted.id } })
+            .then(() => load())
+            .catch((e) => console.error("Ingest failed:", e));
+        }
       }
       await load();
     } catch (e) {

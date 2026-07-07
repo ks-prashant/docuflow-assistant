@@ -1,1 +1,7 @@
 project_id = "hrysntrnvnugkwafabdg"
+
+# The RAG function is called from the browser with the public (anon) key, matching
+# the public RLS policies already on the tables. verify_jwt = false lets the app
+# invoke it without a signed-in user JWT. The OpenAI key still lives in a secret.
+[functions.rag]
+verify_jwt = false

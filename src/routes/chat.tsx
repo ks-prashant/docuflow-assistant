@@ -56,14 +56,30 @@ function ChatPage() {
       content: text,
       citations: [],
     });
+    await load();
 
-    // Placeholder assistant response — AI logic not built yet
-    await supabase.from("chat_messages").insert({
-      role: "assistant",
-      content:
-        "I'll answer using your documents once the AI logic is connected. This is a placeholder response so you can see how answers and their sources will appear.",
-      citations: [],
-    });
+    // Ask the RAG edge function: it embeds the question, retrieves the closest
+    // chunks, and answers strictly from them — returning { answer, citations }.
+    try {
+      const { data, error } = await supabase.functions.invoke("rag", {
+        body: { action: "ask", question: text },
+      });
+      if (error) throw error;
+
+      await supabase.from("chat_messages").insert({
+        role: "assistant",
+        content: data?.answer ?? "Something went wrong answering that.",
+        citations: data?.citations ?? [],
+      });
+    } catch (e) {
+      await supabase.from("chat_messages").insert({
+        role: "assistant",
+        content:
+          "I couldn't reach the answering service. " +
+          (e instanceof Error ? e.message : "Please try again."),
+        citations: [],
+      });
+    }
 
     await load();
     setSending(false);
