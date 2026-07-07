@@ -26,6 +26,9 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 // from a PDF without native binaries, which is exactly what a Deno edge runtime
 // needs. We ask it for text PER PAGE so every chunk can carry a page number.
 import { extractText, getDocumentProxy } from "https://esm.sh/unpdf@0.12.1";
+// Retrieval quality + safety are split into their own small, swappable modules.
+import { rerank } from "./rerank.ts";     // wide-recall candidates → precise top-N
+import { maskOutputs } from "./mask.ts";  // OUTPUT-ONLY PII masking (answer + snippets)
 
 // ---------------------------------------------------------------------------
 // Configuration — all the knobs in one place so they're easy to explain/tune.
@@ -39,12 +42,13 @@ const CHUNK_OVERLAP = 150;    // characters shared between neighbours so we don'
                               // slice a sentence/idea cleanly in half at a boundary
 const EMBED_BATCH_SIZE = 96;  // how many chunks we embed per OpenAI request
 
-const RETRIEVE_TOP_K = 8;     // how many chunks to feed the LLM per question. Broad
-                              // questions ("what is this about?") need several passages
-                              // to synthesize from, so we keep this generous.
-const MIN_SIMILARITY = 0.15;  // below this, a chunk is "not really a match". Kept low so
-                              // vaguely-worded questions still gather relevant context;
-                              // the prompt (not the threshold) decides when to refuse.
+// Retrieval is now WIDE then TIGHT: cast a wide net for recall, rerank for precision.
+const RETRIEVE_CANDIDATES = 25; // how many to pull from EACH search arm (semantic + keyword)
+const RERANK_TOP_N = 8;         // how many survive reranking and reach the answer model
+const SEMANTIC_FLOOR = 0.05;    // a very low garbage floor ONLY. We no longer refuse on a
+                                // similarity threshold — we always pass candidates to the
+                                // LLM and let its prompt rules decide (Change 2).
+const RRF_K = 60;               // Reciprocal Rank Fusion constant (the standard default)
 
 // The refusal string is defined once so the prompt and any fallback stay in sync.
 const NOT_FOUND_MESSAGE = "That's not in the provided documents";
@@ -223,44 +227,85 @@ async function ingest(documentId: string) {
   }
 }
 
+// A retrieved chunk, in the shape both search RPCs return (semantic adds
+// `similarity`, keyword adds `rank`; we only rely on the shared fields + `id`).
+interface Chunk {
+  id: string;
+  document_id: string;
+  content: string;
+  page_number: number | null;
+  filename: string;
+}
+
+/**
+ * Reciprocal Rank Fusion — merge several ranked lists into one.
+ * Each list votes for a chunk by its POSITION (rank 1, 2, 3…); a chunk's fused
+ * score is the sum of 1/(k + rank) across the lists it appears in. This rewards
+ * chunks that rank high in EITHER search without needing the two scores (cosine
+ * vs ts_rank, which aren't comparable) to be on the same scale. Standard k=60.
+ */
+function rrf(lists: Chunk[][], k: number): Chunk[] {
+  const score = new Map<string, number>();
+  const byId = new Map<string, Chunk>();
+  for (const list of lists) {
+    list.forEach((item, i) => {
+      const rank = i + 1; // 1-based
+      score.set(item.id, (score.get(item.id) ?? 0) + 1 / (k + rank));
+      if (!byId.has(item.id)) byId.set(item.id, item);
+    });
+  }
+  return [...byId.values()].sort((a, b) => score.get(b.id)! - score.get(a.id)!);
+}
+
 // ===========================================================================
-// ACTION 2 — ASK: question  →  retrieve top chunks  →  grounded answer
+// ACTION 2 — ASK: question → hybrid retrieve → rerank → grounded answer → mask
 // ===========================================================================
 async function ask(question: string) {
+  const warnings: string[] = []; // soft, non-fatal issues to surface in the UI
+
   // 1. Turn the question into the same kind of vector as our chunks.
   const [questionEmbedding] = await embed([question]);
 
-  // 2. Ask Postgres for the closest chunks (see the SQL migration). This is the
-  //    "R" in RAG — everything the model is allowed to use comes from here.
-  const { data: matches, error: matchErr } = await supabase.rpc(
-    "match_document_chunks",
-    {
+  // 2. HYBRID RETRIEVAL — run both searches in parallel:
+  //    • semantic (meaning) via pgvector, with only a very low garbage floor;
+  //    • keyword (exact terms) via Postgres full-text search.
+  //    Either arm failing is a real error we surface — never a silent empty result.
+  const [sem, fts] = await Promise.all([
+    supabase.rpc("match_document_chunks", {
       query_embedding: JSON.stringify(questionEmbedding),
-      match_count: RETRIEVE_TOP_K,
-      min_similarity: MIN_SIMILARITY,
-    },
-  );
-  if (matchErr) throw new Error(`Retrieval failed: ${matchErr.message}`);
+      match_count: RETRIEVE_CANDIDATES,
+      min_similarity: SEMANTIC_FLOOR,
+    }),
+    supabase.rpc("match_document_chunks_fts", {
+      query_text: question,
+      match_count: RETRIEVE_CANDIDATES,
+    }),
+  ]);
+  if (sem.error) throw new Error(`Semantic retrieval failed: ${sem.error.message}`);
+  if (fts.error) throw new Error(`Keyword retrieval failed: ${fts.error.message}`);
 
-  type Match = {
-    id: string; document_id: string; content: string;
-    page_number: number | null; filename: string; similarity: number;
-  };
-  const chunks = (matches ?? []) as Match[];
+  // 3. Fuse the two ranked lists into one candidate list (Reciprocal Rank Fusion).
+  const fused = rrf([(sem.data ?? []) as Chunk[], (fts.data ?? []) as Chunk[]], RRF_K);
 
-  // 3. Hard guardrail: if nothing cleared the similarity bar, we don't even call
-  //    the LLM. No relevant context ⇒ the honest answer is the refusal string.
-  if (chunks.length === 0) {
+  // Only refuse up front if there is genuinely nothing to work with (e.g. no
+  // documents indexed). Otherwise we ALWAYS let the model judge relevance.
+  if (fused.length === 0) {
     return { answer: NOT_FOUND_MESSAGE, citations: [] };
   }
 
-  // 4. Build a numbered context block. Numbering lets the model cite "[1]", and
+  // 4. RERANK for precision: score the wide candidate set against the question and
+  //    keep only the best few. Degrades gracefully (Cohere → LLM → retrieval order).
+  const reranked = await rerank(question, fused.slice(0, RETRIEVE_CANDIDATES), RERANK_TOP_N);
+  if (reranked.warning) warnings.push(reranked.warning);
+  const chunks = reranked.items;
+
+  // 5. Build a numbered context block. Numbering lets the model cite "[1]", and
   //    lets us map that citation back to a real file + page for the UI.
   const context = chunks
     .map((c, i) => `[${i + 1}] (${c.filename}, page ${c.page_number ?? "?"})\n${c.content}`)
     .join("\n\n---\n\n");
 
-  // 5. The system prompt — this is what keeps the model honest. It is grounded
+  // 6. The system prompt — this is what keeps the model honest. It is grounded
   //    (only the passages, no outside knowledge) but NOT extractive-only: the
   //    model may summarize and synthesize ACROSS the passages, so broad questions
   //    like "what is this about?" get a real answer instead of a refusal.
@@ -282,7 +327,7 @@ async function ask(question: string) {
     context,
   ].join("\n");
 
-  // 6. Call the chat model with temperature 0.1 for faithful, stable answers.
+  // 7. Call the chat model with temperature 0.1 for faithful, stable answers.
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -304,14 +349,14 @@ async function ask(question: string) {
   const json = await res.json();
   const answer: string = json.choices?.[0]?.message?.content?.trim() ?? NOT_FOUND_MESSAGE;
 
-  // 7. If the model refused, return no citations. isRefusal() is tolerant of a
+  // 8. If the model refused, return no citations. isRefusal() is tolerant of a
   //    trailing period / casing so a refusal can never slip through and pick up
   //    a bogus source (the bug behind "refusal WITH a citation").
   if (isRefusal(answer)) {
     return { answer: NOT_FOUND_MESSAGE, citations: [] };
   }
 
-  // 8. Attach citations. We surface the passages the model actually cited (by
+  // 9. Attach citations. We surface the passages the model actually cited (by
   //    bracket number); if it answered without brackets, we fall back to the
   //    top 3 retrieved chunks (already ordered best-first) so the source box
   //    honestly reflects what grounded the answer.
@@ -322,13 +367,27 @@ async function ask(question: string) {
     ? chunks.filter((_, i) => citedNumbers.has(i + 1))
     : chunks.slice(0, 3);
 
-  const citations = chosen.map((c) => ({
+  const rawCitations = chosen.map((c) => ({
     document: c.filename,
     page: c.page_number ?? undefined,
     snippet: c.content.length > 240 ? c.content.slice(0, 240) + "…" : c.content,
   }));
 
-  return { answer, citations };
+  // 10. PII MASKING — the very last step, on OUTPUT ONLY. We mask the answer and
+  //     every citation snippet together in one pass. Everything above this line
+  //     (retrieval, reranking, the model) worked on the REAL text; only what we
+  //     hand back to the browser is redacted. Fails closed (never leaks).
+  const toMask = [answer, ...rawCitations.map((c) => c.snippet)];
+  const masked = await maskOutputs(toMask);
+  if (masked.warning) warnings.push(masked.warning);
+
+  const citations = rawCitations.map((c, i) => ({ ...c, snippet: masked.texts[i + 1] }));
+
+  return {
+    answer: masked.texts[0],
+    citations,
+    warning: warnings.length ? warnings.join(" | ") : undefined,
+  };
 }
 
 // ===========================================================================

@@ -27,6 +27,9 @@ function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  // Non-fatal notices from the backend (e.g. reranker fell back, PII redaction
+  // degraded). Surfaced so nothing fails silently, but not stored in chat history.
+  const [warning, setWarning] = useState<string | null>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
 
   async function load() {
@@ -50,6 +53,7 @@ function ChatPage() {
     if (!text || sending) return;
     setSending(true);
     setInput("");
+    setWarning(null);
 
     await supabase.from("chat_messages").insert({
       role: "user",
@@ -65,6 +69,9 @@ function ChatPage() {
         body: { action: "ask", question: text },
       });
       if (error) throw error;
+      // Backend returns a structured error instead of throwing on some failures.
+      if (data?.error) throw new Error(data.error);
+      if (data?.warning) setWarning(data.warning);
 
       await supabase.from("chat_messages").insert({
         role: "assistant",
@@ -111,6 +118,19 @@ function ChatPage() {
         </div>
 
         <div className="pb-8 pt-2">
+          {warning && (
+            <div className="mb-3 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+              <span className="font-medium">Heads up:</span>
+              <span className="flex-1">{warning}</span>
+              <button
+                onClick={() => setWarning(null)}
+                className="text-amber-700/60 hover:text-amber-700 dark:text-amber-400/60"
+                aria-label="Dismiss"
+              >
+                ✕
+              </button>
+            </div>
+          )}
           <form
             onSubmit={(e) => {
               e.preventDefault();
