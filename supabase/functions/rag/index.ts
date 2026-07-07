@@ -290,7 +290,7 @@ function buildSystemPrompt(context: string): string {
 //   {"type":"done","citations":[...],"warning":"...","rerankBackend":"..."}
 //   {"type":"error","error":"..."}
 // ===========================================================================
-function askStream(question: string): ReadableStream<Uint8Array> {
+function askStream(question: string, documentId?: string): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
   return new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -307,22 +307,30 @@ function askStream(question: string): ReadableStream<Uint8Array> {
         const variantEmbeddings = await embed(variants);
 
         // 3. HYBRID RETRIEVAL per variant (semantic + keyword), all in parallel.
+        //    If a specific `documentId` was passed in, both search RPCs receive
+        //    it as `filter_document_id` and add a WHERE clause restricting the
+        //    candidate set to that document's chunks — so RRF, rerank, and the
+        //    LLM only ever see passages from the chosen document. Omitting it
+        //    (undefined → passed as null) preserves the original all-docs behavior.
         const searches = await Promise.all(
           variants.flatMap((variant, i) => [
             supabase.rpc("match_document_chunks", {
               query_embedding: JSON.stringify(variantEmbeddings[i]),
               match_count: RETRIEVE_CANDIDATES,
               min_similarity: SEMANTIC_FLOOR,
+              filter_document_id: documentId ?? null,
             }),
             supabase.rpc("match_document_chunks_fts", {
               query_text: variant,
               match_count: RETRIEVE_CANDIDATES,
+              filter_document_id: documentId ?? null,
             }),
           ]),
         );
         for (const r of searches) {
           if (r.error) throw new Error(`Retrieval failed: ${r.error.message}`);
         }
+
 
         // 4. Fuse all ranked lists with Reciprocal Rank Fusion.
         const fused = rrf(searches.map((r) => (r.data ?? []) as Chunk[]), RRF_K);
@@ -492,7 +500,17 @@ Deno.serve(async (req) => {
     if (action === "ask") {
       const question = (body.question ?? "").toString().trim();
       if (!question) throw new Error("ask requires a non-empty question");
-      return new Response(askStream(question), {
+      // Optional: scope retrieval to a single document. Must look like a UUID
+      // if provided; anything else is rejected up front rather than passed to SQL.
+      let documentId: string | undefined;
+      if (body.documentId !== undefined && body.documentId !== null) {
+        const raw = String(body.documentId);
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw)) {
+          throw new Error("documentId must be a UUID");
+        }
+        documentId = raw;
+      }
+      return new Response(askStream(question, documentId), {
         headers: {
           ...corsHeaders,
           "Content-Type": "application/x-ndjson; charset=utf-8",
@@ -500,6 +518,7 @@ Deno.serve(async (req) => {
         },
       });
     }
+
 
     let result: unknown;
     if (action === "ingest") {
