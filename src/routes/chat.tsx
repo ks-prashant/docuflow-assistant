@@ -1,8 +1,10 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { supabase } from "@/integrations/supabase/client";
 import { AppShell } from "@/components/AppShell";
-import { ArrowUp, FileText, Eraser, ChevronDown } from "lucide-react";
+import { ArrowUp, FileText, Eraser, ChevronDown, FileQuestion } from "lucide-react";
 
 export const Route = createFileRoute("/chat")({
   head: () => ({
@@ -29,6 +31,62 @@ function newThreadId() {
   return crypto.randomUUID();
 }
 
+// Mirrors supabase/functions/rag/index.ts's NOT_FOUND_MESSAGE + isRefusal() so the
+// UI can detect a refusal client-side and render a warmer empty-state instead of a
+// plain bubble. Keep these two in sync if the backend wording ever changes.
+const NOT_FOUND_MESSAGE = "That's not in the provided documents";
+function isRefusalText(text: string): boolean {
+  const normalize = (s: string) =>
+    s.trim().toLowerCase().replace(/['’]/g, "'").replace(/[.!\s]+$/, "");
+  return normalize(text) === normalize(NOT_FOUND_MESSAGE);
+}
+
+const SUGGESTED_QUESTIONS = [
+  "What does this cover?",
+  "What are the exclusions?",
+  "What is the sum insured?",
+];
+
+// The backend cites passages with bracket markers like "[4]" / "[7]" whose numbers
+// are the passage's rank among ALL retrieved chunks (up to 8) — not sequential
+// among just the CITED ones, so raw text can jump "[4] ... [7]" confusingly. The
+// `citations` array the backend sends is always in ascending original-number order
+// (supabase/functions/rag/index.ts: `chunks.filter` preserves index order), so we
+// can safely renumber to a clean 1..N and rewrite each marker as a markdown link
+// (`#cite-N`) that a custom renderer turns into a clickable badge.
+function prepareAnswerMarkdown(content: string, citationCount: number): string {
+  if (citationCount === 0) return content;
+  const seen: number[] = [];
+  for (const m of content.matchAll(/\[(\d+)\]/g)) {
+    const n = Number(m[1]);
+    if (!seen.includes(n)) seen.push(n);
+  }
+  seen.sort((a, b) => a - b);
+  const displayNumber = new Map(seen.map((orig, i) => [orig, i + 1]));
+  return content.replace(/\[(\d+)\]/g, (full, numStr) => {
+    const disp = displayNumber.get(Number(numStr));
+    return disp ? `[${disp}](#cite-${disp})` : full;
+  });
+}
+
+// The backend's citation snippet is a hard 240-char slice of the source chunk, so
+// it often starts/ends mid-sentence. Purely cosmetic client-side cleanup: trim to
+// the nearest full sentence and mark a mid-passage start with a leading "…" rather
+// than silently showing a fragment.
+function cleanSnippet(snippet: string): string {
+  let s = snippet.trim();
+  const wasTruncated = s.endsWith("…");
+  if (wasTruncated) s = s.slice(0, -1).trim();
+  const lastEnd = Math.max(s.lastIndexOf(". "), s.lastIndexOf("? "), s.lastIndexOf("! "));
+  if (lastEnd > s.length * 0.4) {
+    s = s.slice(0, lastEnd + 1);
+  } else if (wasTruncated) {
+    s = s + "…";
+  }
+  if (/^[a-z]/.test(s)) s = "…" + s;
+  return s;
+}
+
 function ChatPage() {
   // Fresh thread per visit. History is deliberately NOT loaded from the DB —
   // new messages are still persisted (tagged with this thread id) but old
@@ -38,6 +96,8 @@ function ChatPage() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [streamingText, setStreamingText] = useState<string | null>(null);
+  // A soft, non-technical notice shown when the backend degraded gracefully (e.g.
+  // reranker fell back). Full detail always goes to the console for debugging.
   const [warning, setWarning] = useState<string | null>(null);
 
   // Document scope. `ALL_DOCS` means "search across every indexed document"
@@ -98,13 +158,13 @@ function ChatPage() {
   }
 
   const scopedDoc = scopeId === ALL_DOCS ? null : indexedDocs.find((d) => d.id === scopeId);
-  const scopeLabel = scopedDoc ? scopedDoc.filename : "All documents";
+  const scopeLabel = scopedDoc ? scopedDoc.filename : "your documents";
 
-  async function send() {
-    const text = input.trim();
+  // Core send path, parameterized so both the input box and the refusal's
+  // suggested-question chips can trigger it.
+  async function sendText(text: string) {
     if (!text || sending) return;
     setSending(true);
-    setInput("");
     setWarning(null);
 
     // Optimistic user bubble so the UI updates immediately.
@@ -169,7 +229,12 @@ function ChatPage() {
           setStreamingText(full);
         } else if (ev.type === "done") {
           citations = ev.citations ?? [];
-          if (ev.warning) setWarning(ev.warning);
+          if (ev.warning) {
+            // Keep full technical detail in the console; show only a soft,
+            // non-technical notice in the chat itself.
+            console.warn("[rag]", ev.warning);
+            setWarning("This answer used a backup method — it should still be accurate.");
+          }
         } else if (ev.type === "error") {
           streamError = ev.error ?? "Unknown error";
         }
@@ -228,6 +293,13 @@ function ChatPage() {
     setSending(false);
   }
 
+  async function send() {
+    const text = input.trim();
+    if (!text || sending) return;
+    setInput("");
+    await sendText(text);
+  }
+
   return (
     <AppShell>
       <div className="mx-auto max-w-3xl px-6 h-[calc(100vh-4rem)] flex flex-col">
@@ -274,25 +346,25 @@ function ChatPage() {
               </h1>
               <p className="mt-4 text-muted-foreground max-w-md">
                 Answers appear with citations to the exact passage. Currently answering
-                from <span className="text-foreground font-medium">{scopeLabel}</span>.
+                from <span className="text-foreground font-medium">{scopeLabel === "your documents" ? "all documents" : scopeLabel}</span>.
               </p>
             </div>
           ) : (
             <div className="space-y-8">
               {messages.map((m) => (
-                <MessageBubble key={m.id} message={m} />
+                <MessageBubble key={m.id} message={m} scopeLabel={scopeLabel} onSuggest={sendText} />
               ))}
               {streamingText !== null && streamingText.length > 0 ? (
                 <div className="space-y-3">
-                  <div className="text-[15px] leading-relaxed whitespace-pre-wrap">
-                    {streamingText}
+                  <div className="text-[15px] leading-relaxed">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents()}>
+                      {streamingText}
+                    </ReactMarkdown>
                     <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse rounded-sm bg-primary/70" />
                   </div>
                 </div>
               ) : (
-                sending && (
-                  <div className="text-sm text-muted-foreground animate-pulse">Thinking…</div>
-                )
+                sending && <ThinkingIndicator />
               )}
             </div>
           )}
@@ -355,7 +427,83 @@ function ChatPage() {
   );
 }
 
-function MessageBubble({ message }: { message: Message }) {
+// Three gently bouncing dots — a more natural "the assistant is working" signal
+// than a plain "Thinking…" label, and reads consistently with the streaming
+// cursor once tokens start arriving.
+function ThinkingIndicator() {
+  return (
+    <div className="flex items-center gap-1 py-1" aria-label="Thinking">
+      {[0, 1, 2].map((i) => (
+        <span
+          key={i}
+          className="h-1.5 w-1.5 rounded-full bg-muted-foreground/50 animate-bounce"
+          style={{ animationDelay: `${i * 120}ms` }}
+        />
+      ))}
+    </div>
+  );
+}
+
+// Shared markdown rendering rules for assistant text — used for both the final
+// message and the live streaming preview. `onCiteClick` is optional; when
+// omitted (the streaming preview, which has no stable citation list yet),
+// citation markers just render inert since `prepareAnswerMarkdown` hasn't run.
+function markdownComponents(onCiteClick?: (n: number) => void) {
+  return {
+    p: ({ children }: { children?: ReactNode }) => <p className="mb-2 last:mb-0">{children}</p>,
+    strong: ({ children }: { children?: ReactNode }) => (
+      <strong className="font-semibold text-foreground">{children}</strong>
+    ),
+    ul: ({ children }: { children?: ReactNode }) => (
+      <ul className="my-2 ml-5 list-disc space-y-1">{children}</ul>
+    ),
+    ol: ({ children }: { children?: ReactNode }) => (
+      <ol className="my-2 ml-5 list-decimal space-y-1">{children}</ol>
+    ),
+    li: ({ children }: { children?: ReactNode }) => <li className="pl-1">{children}</li>,
+    h1: ({ children }: { children?: ReactNode }) => (
+      <h3 className="mt-3 mb-1 text-base font-semibold">{children}</h3>
+    ),
+    h2: ({ children }: { children?: ReactNode }) => (
+      <h3 className="mt-3 mb-1 text-base font-semibold">{children}</h3>
+    ),
+    h3: ({ children }: { children?: ReactNode }) => (
+      <h4 className="mt-2 mb-1 text-[15px] font-semibold">{children}</h4>
+    ),
+    a: ({ href, children }: { href?: string; children?: ReactNode }) => {
+      if (href?.startsWith("#cite-")) {
+        const n = Number(href.replace("#cite-", ""));
+        return (
+          <button
+            type="button"
+            onClick={() => onCiteClick?.(n)}
+            className="mx-0.5 inline-flex h-4 min-w-4 translate-y-[-3px] items-center justify-center rounded-full bg-primary/10 px-1 text-[10px] font-semibold text-primary hover:bg-primary/20 transition-colors"
+          >
+            {n}
+          </button>
+        );
+      }
+      return (
+        <a href={href} target="_blank" rel="noreferrer" className="text-primary underline underline-offset-2">
+          {children}
+        </a>
+      );
+    },
+  };
+}
+
+function MessageBubble({
+  message,
+  scopeLabel,
+  onSuggest,
+}: {
+  message: Message;
+  scopeLabel: string;
+  onSuggest: (q: string) => void;
+}) {
+  const [sourcesOpen, setSourcesOpen] = useState(false);
+  const [highlightNum, setHighlightNum] = useState<number | null>(null);
+
   if (message.role === "user") {
     return (
       <div className="flex justify-end">
@@ -365,38 +513,140 @@ function MessageBubble({ message }: { message: Message }) {
       </div>
     );
   }
+
+  // Refusal: a warm empty-state with suggested next questions. There is nothing
+  // to cite, so no Source panel is rendered at all.
+  if (isRefusalText(message.content)) {
+    return <RefusalCard scopeLabel={scopeLabel} onSuggest={onSuggest} />;
+  }
+
+  function handleCiteClick(n: number) {
+    setSourcesOpen(true);
+    setHighlightNum(n);
+    // Let the panel expand before scrolling to its now-rendered card.
+    requestAnimationFrame(() => {
+      document.getElementById(`cite-${n}-${message.id}`)?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    });
+    window.setTimeout(() => setHighlightNum(null), 1600);
+  }
+
+  const displayText = prepareAnswerMarkdown(message.content, message.citations.length);
+
   return (
     <div className="space-y-3">
-      <div className="text-[15px] leading-relaxed whitespace-pre-wrap">{message.content}</div>
-      <SourceBlock citations={message.citations} />
+      <div className="text-[15px] leading-relaxed">
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents(handleCiteClick)}>
+          {displayText}
+        </ReactMarkdown>
+      </div>
+      <SourcePanel
+        citations={message.citations}
+        messageId={message.id}
+        expanded={sourcesOpen}
+        onToggle={() => setSourcesOpen((v) => !v)}
+        highlightNum={highlightNum}
+      />
     </div>
   );
 }
 
-function SourceBlock({ citations }: { citations: Citation[] }) {
+function RefusalCard({
+  scopeLabel,
+  onSuggest,
+}: {
+  scopeLabel: string;
+  onSuggest: (q: string) => void;
+}) {
   return (
-    <div className="rounded-xl border border-border bg-card/60 px-4 py-3">
-      <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-        <FileText className="h-3.5 w-3.5" />
-        Source
-      </div>
-      {citations.length === 0 ? (
-        <div className="mt-2 text-sm text-muted-foreground italic">
-          No source cited for this reply.
+    <div className="space-y-3 rounded-xl border border-border bg-card/60 px-4 py-3.5">
+      <div className="flex items-start gap-2.5">
+        <div className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-muted">
+          <FileQuestion className="h-3.5 w-3.5 text-muted-foreground" />
         </div>
-      ) : (
+        <p className="text-[15px] leading-relaxed text-muted-foreground">
+          I couldn't find anything about that in{" "}
+          <span className="font-medium text-foreground">{scopeLabel}</span>. Try one of
+          these instead, or rephrase your question:
+        </p>
+      </div>
+      <div className="flex flex-wrap gap-2 pl-8">
+        {SUGGESTED_QUESTIONS.map((q) => (
+          <button
+            key={q}
+            type="button"
+            onClick={() => onSuggest(q)}
+            className="rounded-full border border-border bg-background px-3 py-1.5 text-xs font-medium hover:border-primary/50 hover:text-primary transition-colors"
+          >
+            {q}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SourcePanel({
+  citations,
+  messageId,
+  expanded,
+  onToggle,
+  highlightNum,
+}: {
+  citations: Citation[];
+  messageId: string;
+  expanded: boolean;
+  onToggle: () => void;
+  highlightNum: number | null;
+}) {
+  if (citations.length === 0) return null;
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-xs font-medium text-muted-foreground hover:text-foreground hover:border-primary/40 transition-colors"
+        aria-expanded={expanded}
+      >
+        <FileText className="h-3 w-3" />
+        Sources ({citations.length})
+        <ChevronDown className={`h-3 w-3 transition-transform ${expanded ? "rotate-180" : ""}`} />
+      </button>
+      {expanded && (
         <ul className="mt-2 space-y-2">
-          {citations.map((c, i) => (
-            <li key={i} className="text-sm">
-              <span className="font-medium">{c.document}</span>
-              {c.page ? <span className="text-muted-foreground"> · p.{c.page}</span> : null}
-              {c.snippet ? (
-                <p className="mt-1 text-muted-foreground border-l-2 border-border pl-3">
-                  {c.snippet}
-                </p>
-              ) : null}
-            </li>
-          ))}
+          {citations.map((c, i) => {
+            const n = i + 1;
+            return (
+              <li
+                key={i}
+                id={`cite-${n}-${messageId}`}
+                className={
+                  "rounded-lg border px-3 py-2 text-sm transition-colors " +
+                  (highlightNum === n
+                    ? "border-primary/60 bg-primary/5"
+                    : "border-border bg-card/60")
+                }
+              >
+                <div className="flex items-center gap-2">
+                  <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary/10 text-[10px] font-semibold text-primary">
+                    {n}
+                  </span>
+                  <span className="font-medium truncate">{c.document}</span>
+                  {c.page ? (
+                    <span className="shrink-0 text-xs text-muted-foreground">p.{c.page}</span>
+                  ) : null}
+                </div>
+                {c.snippet ? (
+                  <p className="mt-1 pl-6 text-muted-foreground italic">
+                    "{cleanSnippet(c.snippet)}"
+                  </p>
+                ) : null}
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>
