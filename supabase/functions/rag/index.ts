@@ -297,42 +297,72 @@ function askStream(question: string, documentId?: string): ReadableStream<Uint8A
       const send = (obj: unknown) => controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
       const warnings: string[] = [];
       try {
-        // 1. QUERY TRANSFORM — always expand the question into 2–3 search variants
-        //    (jargon/synonyms + vague→concrete). Falls back to the original on failure.
-        const t = await transformQuery(question);
-        if (t.warning) warnings.push(t.warning);
-        const variants = t.variants;
+        // 1. QUERY TRANSFORM + ORIGINAL-QUESTION RETRIEVAL, IN PARALLEL (perf fix).
+        //    transformQuery() is a full non-streamed LLM call that previously had
+        //    to finish completely before we could even embed the question. But the
+        //    ORIGINAL question doesn't need the rewrite at all — only the EXTRA
+        //    jargon-expanded variants do. So we kick off the rewrite and the
+        //    original question's embedding+retrieval at the same time, instead of
+        //    waiting on the LLM before searching at all. This changes nothing
+        //    about WHAT gets searched (same variants end up in the same fused
+        //    list) — only WHEN each step starts.
+        // Both search RPCs for one variant's embedding+text. Returned as a plain
+        // array (not a tuple) so Promise.all(...) over any number of variants —
+        // one now, more later — always resolves to the same array type.
+        type RpcResult = ReturnType<typeof supabase.rpc>;
+        const searchVariant = (variant: string, embedding: number[]): RpcResult[] => [
+          supabase.rpc("match_document_chunks", {
+            query_embedding: JSON.stringify(embedding),
+            match_count: RETRIEVE_CANDIDATES,
+            min_similarity: SEMANTIC_FLOOR,
+            filter_document_id: documentId ?? null,
+          }),
+          supabase.rpc("match_document_chunks_fts", {
+            query_text: variant,
+            match_count: RETRIEVE_CANDIDATES,
+            filter_document_id: documentId ?? null,
+          }),
+        ];
 
-        // 2. Embed all variants in one call.
-        const variantEmbeddings = await embed(variants);
-
-        // 3. HYBRID RETRIEVAL per variant (semantic + keyword), all in parallel.
-        //    If a specific `documentId` was passed in, both search RPCs receive
-        //    it as `filter_document_id` and add a WHERE clause restricting the
-        //    candidate set to that document's chunks — so RRF, rerank, and the
-        //    LLM only ever see passages from the chosen document. Omitting it
-        //    (undefined → passed as null) preserves the original all-docs behavior.
-        const searches = await Promise.all(
-          variants.flatMap((variant, i) => [
-            supabase.rpc("match_document_chunks", {
-              query_embedding: JSON.stringify(variantEmbeddings[i]),
-              match_count: RETRIEVE_CANDIDATES,
-              min_similarity: SEMANTIC_FLOOR,
-              filter_document_id: documentId ?? null,
-            }),
-            supabase.rpc("match_document_chunks_fts", {
-              query_text: variant,
-              match_count: RETRIEVE_CANDIDATES,
-              filter_document_id: documentId ?? null,
-            }),
-          ]),
+        const transformPromise = transformQuery(question);
+        const originalSearchPromise: Promise<Awaited<RpcResult>[]> = embed([question]).then(
+          ([originalEmbedding]) => Promise.all(searchVariant(question, originalEmbedding)),
         );
+
+        // 2. Once the rewrite resolves, embed + retrieve ONLY its extra variants —
+        //    the original is already in flight above, so we never re-search it.
+        //    If the rewrite adds nothing new (or fails and falls back to just the
+        //    original), this is a no-op and costs no extra time.
+        const t = await transformPromise;
+        if (t.warning) warnings.push(t.warning);
+        const extraVariants = t.variants.filter((v) => v.toLowerCase() !== question.toLowerCase());
+
+        const extraSearchesPromise: Promise<Awaited<RpcResult>[]> =
+          extraVariants.length === 0
+            ? Promise.resolve([])
+            : embed(extraVariants).then((extraEmbeddings) =>
+                Promise.all(
+                  extraVariants.flatMap((variant, i) => searchVariant(variant, extraEmbeddings[i])),
+                ),
+              );
+
+        // If a specific `documentId` was passed in, every search RPC above
+        // received it as `filter_document_id`, restricting the candidate set to
+        // that document's chunks — so RRF, rerank, and the LLM only ever see
+        // passages from the chosen document. Omitting it (undefined → null)
+        // preserves the original all-docs behavior.
+        const [originalSearches, extraSearches] = await Promise.all([
+          originalSearchPromise,
+          extraSearchesPromise,
+        ]);
+        const searches = [...originalSearches, ...extraSearches];
         for (const r of searches) {
           if (r.error) throw new Error(`Retrieval failed: ${r.error.message}`);
         }
 
-
-        // 4. Fuse all ranked lists with Reciprocal Rank Fusion.
+        // 3. Fuse all ranked lists with Reciprocal Rank Fusion. Same inputs and
+        //    scores as before — RRF sums are commutative across lists, so this
+        //    concatenation order doesn't change the result.
         const fused = rrf(searches.map((r) => (r.data ?? []) as Chunk[]), RRF_K);
         if (fused.length === 0) {
           send({ type: "token", text: NOT_FOUND_MESSAGE });
@@ -341,27 +371,31 @@ function askStream(question: string, documentId?: string): ReadableStream<Uint8A
           return;
         }
 
-        // 5. Rerank against the ORIGINAL question; keep the best few.
-        const reranked = await rerank(question, fused.slice(0, RETRIEVE_CANDIDATES), RERANK_TOP_N);
+        // 4. RERANK + PII-SPAN LOOKUP, IN PARALLEL (perf fix). The PII lookup only
+        //    needs to know WHICH documents are in play, and the fused (pre-rerank)
+        //    candidate list already tells us that — reranking only narrows which
+        //    CHUNKS survive, not which documents, so fused docIds are always a
+        //    safe superset of the reranked docIds. Fetching it now instead of
+        //    after rerank() removes a serial DB round-trip from the critical path.
+        const fusedForRerank = fused.slice(0, RETRIEVE_CANDIDATES);
+        const fusedDocIds = [...new Set(fusedForRerank.map((c) => c.document_id))];
+        const [reranked, piiSpansResult] = await Promise.all([
+          rerank(question, fusedForRerank, RERANK_TOP_N),
+          supabase.from("documents").select("pii_spans").in("id", fusedDocIds),
+        ]);
         if (reranked.warning) warnings.push(reranked.warning);
         const chunks = reranked.items;
+        // Extracted reliably at ingestion, so masking never depends on a
+        // per-question LLM guess (reliable AND faster).
+        const piiSpans = [...new Set(
+          (piiSpansResult.data ?? []).flatMap((d) => (d.pii_spans ?? []) as string[]),
+        )].sort((a, b) => b.length - a.length); // longer first: full name before surname
 
-        // 6. Build numbered context + the detailed, mask-aware system prompt.
+        // 5. Build numbered context + the detailed, mask-aware system prompt.
         const context = chunks
           .map((c, i) => `[${i + 1}] (${c.filename}, page ${c.page_number ?? "?"})\n${c.content}`)
           .join("\n\n---\n\n");
         const systemPrompt = buildSystemPrompt(context);
-
-        // 7. Load this document's stored PERSONAL-DATA spans (names + addresses),
-        //    extracted reliably at ingestion. We mask these deterministically in
-        //    the stream — the model alone does NOT reliably mask names inline, and
-        //    a stored list means no per-question LLM guess (reliable AND faster).
-        const docIds = [...new Set(chunks.map((c) => c.document_id))];
-        const { data: docRows } = await supabase
-          .from("documents").select("pii_spans").in("id", docIds);
-        const piiSpans = [...new Set(
-          (docRows ?? []).flatMap((d) => (d.pii_spans ?? []) as string[]),
-        )].sort((a, b) => b.length - a.length); // longer first: full name before surname
 
         // Stream the answer from OpenAI. Flush at SENTENCE boundaries so a whole
         // name is always within the segment we mask (regex + known spans).
